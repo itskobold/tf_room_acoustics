@@ -22,9 +22,9 @@ def gaussian_ic(x, y,
 # Absorbing boundary condition: lose energy at edges defined by abs_coeffs
 def absorbing_bc(side, boundary_abs, current_p, prev_p, x, y, inversion=True):
     rt2 = np.sqrt(2.0)
-    a0 = rt2 / (rt2 + boundary_abs[f'{side}_abs'])
-    a1 = 1 / (2.0 + (rt2 * boundary_abs[f'{side}_abs']))
-    a2 = (boundary_abs[f'{side}_abs'] - rt2) / (boundary_abs[f'{side}_abs'] + rt2)
+    a0 = rt2 / (rt2 + boundary_abs[side])
+    a1 = 1 / (2.0 + (rt2 * boundary_abs[side]))
+    a2 = (boundary_abs[side] - rt2) / (boundary_abs[side] + rt2)
 
     if inversion:
         inv = -1

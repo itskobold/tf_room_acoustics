@@ -6,7 +6,7 @@ import pickle
 import json
 
 
-# Class for managing FDTD simulation data
+# Class for managing FDTD simulation
 class FDTD:
     # Init FDTD settings
     def __init__(self,
@@ -114,7 +114,7 @@ class FDTD:
             next_p = pressure[:, :, step + 1]
 
             # FD process
-            # TODO: use slices to make this more efficient/tidier?
+            # TODO: use slices to make this more efficient/tidier, GPU implementation
             for x in range(self.x_len_samples):
                 for y in range(self.y_len_samples):
                     # Bottom left corner

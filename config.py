@@ -11,18 +11,18 @@ SAMPLE_RATE = 48000  # Sample rate for rendered impulse responses
 COLORMAP = 'coolwarm'  # Colormap of rendered animations
 
 # Initial and boundary conditions
-IMPULSE_X = 0  # Impulse X position within domain (meters)
-IMPULSE_Y = 0  # Impulse Y position within domain (meters)
+IMPULSE_X = 0  # Impulse X real position within domain (meters)
+IMPULSE_Y = 0  # Impulse Y real position within domain (meters)
 IMPULSE_A = 1.  # Impulse amplitude
-IMPULSE_R = 0.025  # Impulse radius (std. deviation)
+IMPULSE_R = 0.025  # Impulse variance
 BOUNDARY_L_ABS = 0.5  # Left boundary absorption
 BOUNDARY_R_ABS = 0.5  # Right boundary absorption
 BOUNDARY_B_ABS = 0.5  # Bottom boundary absorption
 BOUNDARY_T_ABS = 0.5  # Top boundary absorption
-BOUNDARY_ABS = {'left_abs': BOUNDARY_L_ABS,
-                'right_abs': BOUNDARY_R_ABS,
-                'bottom_abs': BOUNDARY_B_ABS,
-                'top_abs': BOUNDARY_T_ABS}
+BOUNDARY_ABS = {'left': BOUNDARY_L_ABS,
+                'right': BOUNDARY_R_ABS,
+                'bottom': BOUNDARY_B_ABS,
+                'top': BOUNDARY_T_ABS}
 
 # FDTD stuff
 FDTD_F_MAX = 100  # Maximum resolvable frequency from FDTD solution
