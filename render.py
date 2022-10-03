@@ -1,6 +1,5 @@
 import numpy as np
 import config as cfg
-import pickle
 import scipy.io.wavfile as wavf
 import matplotlib.pyplot as plt
 import matplotlib.animation as mpl_anim
