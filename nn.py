@@ -72,10 +72,6 @@ class AcousticNet:
         self.train_X = df.drop("u", axis=1)
         self.train_y = df["u"]
 
-        # Create placeholder variables
-        self.model = None
-        self.history = None
-
     # Create feature labels
     @staticmethod
     def create_x_labels(dims, samples):
