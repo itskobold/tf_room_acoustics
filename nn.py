@@ -1,7 +1,5 @@
 import config as cfg
 import numpy as np
-import pandas as pd
-from sklearn.utils import shuffle
 import tensorflow as tf
 import kormos
 import pickle
@@ -20,9 +18,11 @@ class AcousticNet:
         # Init variables
         self.model = None
         self.history = None
-        self.train_X = None
-        self.train_y = None
         self.data = None
+        self.dataset = None
+        self.padding = None
+        self.input_shape = None
+        self.output_shape = None
 
         print("Initializing neural network...")
 
@@ -34,7 +34,7 @@ class AcousticNet:
 
     # Load prediction data from file
     def load_data(self, file_name):
-        with open(f'{self.manager.get_proj_path()}/{file_name}.pkl', 'rb') as inp:
+        with open(f"{self.manager.get_proj_path()}/{file_name}.pkl", "rb") as inp:
             self.data = pickle.load(inp)
         # with open(f'{self.manager.get_proj_path()}/{file_name}_meta.json', 'r') as inp:
         #    self.metadata = json.load(inp)
@@ -43,8 +43,8 @@ class AcousticNet:
     def save_data(self,
                   file_name_out):
         # Save prediction data
-        file_path = f'{self.manager.get_proj_path()}/{file_name_out}.pkl'
-        with open(file_path, 'wb') as outp:
+        file_path = f"{self.manager.get_proj_path()}/{file_name_out}.pkl"
+        with open(file_path, "wb") as outp:
             pickle.dump(self.data, outp, pickle.HIGHEST_PROTOCOL)
         print(f'Saved prediction data to "{file_path}".')
 
@@ -55,60 +55,95 @@ class AcousticNet:
         # print(f'Saved prediction metadata to "{file_path}".\n')
 
     # Init data from FDTD simulation
-    def init_data(self):
+    def init_data(self,
+                  t_lookback=cfg.NN_T_LOOKBACK,
+                  batch_size=cfg.NN_BATCH_SIZE):
         if self.manager.fdtd.data is None:
             print("Could not initialize neural network data: no FDTD data loaded in module.")
 
-        # Create labels for training data
-        grid = self.create_x_labels_from_fdtd_data()
+        # Create training dataset
+        self.dataset, self.input_shape, self.output_shape = \
+            self.create_training_data_from_fdtd_data(t_lookback=t_lookback,
+                                                     batch_size=batch_size)
 
-        # Create dataset
-        df = grid.join(pd.DataFrame({"u": self.manager.fdtd.data.flatten()}))
-
-        # Shuffle data
-        df = shuffle(df, random_state=self.seed)
-
-        # Split training and target labels
-        self.train_X = df.drop("u", axis=1)
-        self.train_y = df["u"]
-
-    # Create feature labels
+    # Create dataset from data
     @staticmethod
-    def create_x_labels(dims, samples):
-        # Create training data from FDTD data
-        x_len_half = dims[0] / 2
-        y_len_half = dims[1] / 2
-        td_len = dims[2]
-        x_grid, y_grid, t_grid = np.meshgrid(
-            np.linspace(-x_len_half, x_len_half, samples[0]),
-            np.linspace(-y_len_half, y_len_half, samples[1]),
-            np.linspace(0, td_len, samples[2]))
-        return pd.DataFrame({"x": x_grid.flatten(),
-                             "y": y_grid.flatten(),
-                             "t": t_grid.flatten()})
+    def create_dataset(data,
+                       t_lookback=cfg.NN_T_LOOKBACK,
+                       batch_size=cfg.NN_BATCH_SIZE):
+        # Readability
+        x_len_samples = data.shape[-3]
+        y_len_samples = data.shape[-2]
+        td_len_samples = data.shape[-1]
 
-    # Create feature labels from FDTD data
-    def create_x_labels_from_fdtd_data(self):
-        return self.create_x_labels(dims=[self.manager.fdtd.metadata["x_len"],
-                                          self.manager.fdtd.metadata["y_len"],
-                                          self.manager.fdtd.metadata["td_len"]],
-                                    samples=[self.manager.fdtd.metadata["x_len_samples"],
-                                             self.manager.fdtd.metadata["y_len_samples"],
-                                             self.manager.fdtd.metadata["td_len_samples"]])
+        # Create linearly spaced grid
+        x_grid, y_grid = np.meshgrid(np.linspace(0, 1, x_len_samples),
+                                     np.linspace(0, 1, y_len_samples))
+        xy_grid = np.stack([x_grid, y_grid], axis=-1)
+
+        # Loop through all solutions in data set
+        steps_to_predict = td_len_samples - t_lookback
+        a = np.zeros([steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
+        u = np.zeros([steps_to_predict, x_len_samples, y_len_samples, 1])
+        for fdtd_sol in data:
+            # Loop through each solution and create training data for each time slice
+            for i in range(steps_to_predict):
+                # Split data tensor and add to buffers (a, u)
+                # Also add (x, y) coordinate to feature labels a
+                a[i, :, :, :t_lookback] = fdtd_sol[:, :, i:t_lookback + i]
+                a[i, :, :, t_lookback:] = xy_grid
+                u[i] = np.expand_dims(fdtd_sol[:, :, t_lookback + i], axis=-1)
+
+        # Convert to tensors
+        dataset = tf.data.Dataset.from_tensor_slices((a, u)).batch(batch_size=batch_size,
+                                                                   drop_remainder=False)
+
+        # Return split data tensors and input/output shapes
+        return dataset, a.shape[1:], u.shape[1:]
+
+    # Create training data from FDTD data
+    def create_training_data_from_fdtd_data(self,
+                                            t_lookback=cfg.NN_T_LOOKBACK,
+                                            batch_size=cfg.NN_BATCH_SIZE):
+        return self.create_dataset(data=self.manager.fdtd.data,
+                                   t_lookback=t_lookback,
+                                   batch_size=batch_size)
 
     # Create tensorflow model
     def init_model(self,
                    num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
-                   neurons_per_layer=cfg.NN_HL_WIDTH):
+                   width=cfg.NN_HL_WIDTH,
+                   drop_modes=cfg.NN_DROP_MODES,
+                   modes=cfg.NN_MODES):
         print("Initializing neural network model...")
 
         # Create layers
-        layers = [tf.keras.Input(len(self.train_X.columns))]
-        for i in range(num_hidden_layers):
-            layers.append(DenseSine(neurons_per_layer, i)(layers[-1]))
-        layers.append(DenseSine(1, num_hidden_layers)(layers[-1]))
+        layers = [tf.keras.Input(self.input_shape)]
+#
+        # Append up projection layer (linear, no activation)
+        layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
 
-        # Create model
+        # Append FNO layers
+        for i in range(num_hidden_layers):
+            last_layer = layers[-1]
+            fourier_layer = FourierLayer(in_width=width,
+                                         out_width=width,
+                                         drop_modes=drop_modes,
+                                         modes=modes)(last_layer)
+            conv = tf.keras.layers.Conv2D(filters=width,
+                                          kernel_size=1)(last_layer)
+            layers.append(tf.keras.layers.Add()([fourier_layer, conv]))
+            layers.append(tf.keras.layers.Lambda(lambda x: tf.keras.activations.gelu(x))(layers[-1]))
+
+        # Append down projection layer (linear, no activation)
+        layers.append(tf.keras.layers.Dense(128,
+                                            activation=None)(layers[-1]))
+
+        # Append output layer
+        layers.append(tf.keras.layers.Dense(self.output_shape[-1],
+                                            activation=None)(layers[-1]))
+
+        # Create model and print summary
         self.model = kormos.models.BatchOptimizedModel(inputs=layers[0],
                                                        outputs=layers[-1])
         self.model.summary()
@@ -118,7 +153,7 @@ class AcousticNet:
     def fit_model(self,
                   optimizer_mode,
                   options=None,
-                  iterations=cfg.NN_ITERATIONS,
+                  iterations=None,
                   batch_size=cfg.NN_BATCH_SIZE):
         print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
 
@@ -131,11 +166,15 @@ class AcousticNet:
                            "decay_steps": cfg.NN_LR_DECAY_STEPS,
                            "decay_rate": cfg.NN_LR_DECAY_RATE}
 
+            # Same for number of iterations
+            if iterations is None:
+                iterations = cfg.NN_ITERATIONS_ADAM
+
             # Set learning rate
             if options["lr_decay"]:
-                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options['learning_rate'],
-                                                                    decay_steps=options['decay_steps'],
-                                                                    decay_rate=options['decay_rate'])
+                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
+                                                                    decay_steps=options["decay_steps"],
+                                                                    decay_rate=options["decay_rate"])
             else:
                 lr = options["learning_rate"]
 
@@ -148,6 +187,10 @@ class AcousticNet:
             if options is None:
                 options = {"maxcor": cfg.NN_MAXCOR,
                            "gtol": cfg.NN_GTOL}
+
+            # Same for number of iterations
+            if iterations is None:
+                iterations = cfg.NN_ITERATIONS_L_BFGS_B
 
             # Set optimizer
             optimizer = kormos.optimizers.ScipyBatchOptimizer()
@@ -165,14 +208,12 @@ class AcousticNet:
         # Begin training
         print("Starting training.")
 
-        if optimizer_mode == 'adam':
-            self.history = self.model.fit(self.train_X,
-                                          self.train_y,
+        if optimizer_mode == "adam":
+            self.history = self.model.fit(self.dataset,
                                           batch_size=batch_size,
                                           epochs=iterations)
         else:
-            self.history = self.model.fit(self.train_X,
-                                          self.train_y,
+            self.history = self.model.fit(self.dataset,
                                           batch_size=batch_size,
                                           epochs=iterations,
                                           method=optimizer_mode,
@@ -180,87 +221,78 @@ class AcousticNet:
 
     # Get predictions for a data set
     def get_prediction(self,
-                       data=None,
+                       data,
                        batch_size=cfg.NN_BATCH_SIZE):
-        # Predict whole field at source FDTD resolution if no data specified
-        if data is None:
-            data = self.create_x_labels_from_fdtd_data()
+        # Prepare dataset from data
+        dataset, in_shape, out_shape = self.create_dataset(data)
+        assert in_shape == self.input_shape
+        assert out_shape == self.output_shape
 
         # Get prediction
-        raw = self.model.predict(data,
+        raw = self.model.predict(dataset,
                                  batch_size=batch_size)
 
-        # Reshape to match source
-        self.data = raw.reshape((self.manager.fdtd.metadata["x_len_samples"],
-                                 self.manager.fdtd.metadata["y_len_samples"],
-                                 self.manager.fdtd.metadata["td_len_samples"]))
+        # Transpose to match source
+        self.data = np.transpose(np.squeeze(raw), (1, 2, 0))
 
 
-# Dense hidden layer with adaptive sinusoidal activation
-class DenseSine(tf.keras.layers.Layer):
+# Fourier neural operator layer
+class FourierLayer(tf.keras.layers.Layer):
     def __init__(self,
-                 units,
-                 layer_num,
-                 adaptive_activation=cfg.NN_ADAPTIVE_ACTIVATION):
-        super(DenseSine, self).__init__()
-        self.units = units
-        self.layer_num = layer_num
-        self.adaptive_activation = adaptive_activation
+                 in_width=cfg.NN_HL_WIDTH,
+                 out_width=cfg.NN_HL_WIDTH,
+                 drop_modes=cfg.NN_DROP_MODES,
+                 modes=cfg.NN_MODES,
+                 batch_size=cfg.NN_BATCH_SIZE):
+        super(FourierLayer, self).__init__()
+        self.in_width = in_width
+        self.out_width = out_width
+        self.drop_modes = drop_modes
+        self.modes = modes
+        self.batch_size = batch_size
+        self.scale = 1 / (self.in_width * self.out_width)
         self.w = None
         self.b = None
-        self.a = None
 
     def build(self, input_shape):
+        # Get shape of weight matrix in real space
+        weight_shape = input_shape[1:]
+
         # Initialize weights
-        w_init = SineInit(self.layer_num)
+        w_init = self.scale * tf.random.uniform(shape=weight_shape,
+                                                dtype=self.dtype)
         self.w = tf.Variable(name="kernel",
-                             initial_value=w_init(shape=([input_shape[-1], self.units]),
-                                                  dtype=self.dtype),
+                             initial_value=w_init,
                              trainable=True,
                              dtype=self.dtype)
 
         # Initialize biases
-        b_init = tf.zeros_initializer()
+        b_init = tf.zeros_initializer()(shape=weight_shape,
+                                        dtype=self.dtype)
         self.b = tf.Variable(name="bias",
-                             initial_value=b_init(shape=(self.units,),
-                                                  dtype=self.dtype),
+                             initial_value=b_init,
                              trainable=True,
                              dtype=self.dtype)
 
-        # Initialise activation coefficients
-        if self.adaptive_activation:
-            self.a = tf.Variable(name="activation_coeff",
-                                 initial_value=2,
-                                 trainable=True,
-                                 dtype=self.dtype)
-        else:
-            self.a = tf.constant(2, dtype=self.dtype)
-
     def call(self, inputs):
-        w_b = tf.matmul(inputs, self.w) + self.b
-        ac = tf.math.multiply(self.a, np.pi)
-        return tf.math.sin(tf.math.multiply(w_b, ac))
+        # Fourier transform on inputs, weights and bias weights
+        x_ft = tf.signal.rfft2d(inputs)
+        w_ft = tf.signal.rfft2d(self.w)
+        b_ft = tf.signal.rfft2d(self.b)
 
+        # Multiply Fourier modes with transformed weight matrix and add bias
+        xw_ft = tf.add(tf.multiply(x_ft, w_ft), b_ft)
 
-# Weight initialisation for sinusoidal layers
-class SineInit(tf.keras.initializers.Initializer):
-    def __init__(self, layer):
-        self.layer = layer
+        # Mask out Fourier modes as a regularisation measure
+        if self.drop_modes:
+            mask = np.zeros(w_ft.shape)
+            ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
+            mask[:self.modes, :self.modes, :] = ones
+            mask[-self.modes:, :self.modes, :] = ones
+            mask[:self.modes, -self.modes:, :] = ones
+            mask[-self.modes:, -self.modes:, :] = ones
+            mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
+            xw_ft = tf.multiply(xw_ft, mask_tf)
 
-    def __call__(self, shape, dtype=None, **kwargs):
-        num_input = shape[0]
-
-        if self.layer == 0:
-            dist = tf.random.uniform(shape,
-                                     minval=-1 / num_input,
-                                     maxval=1 / num_input,
-                                     dtype=dtype)
-        else:
-            dist = tf.random.uniform(shape,
-                                     minval=-np.sqrt(6 / num_input) / 30,
-                                     maxval=np.sqrt(6 / num_input) / 30,
-                                     dtype=dtype)
-        return dist
-
-    def get_config(self):
-        return {"layer": self.layer}
+        # Inverse FFT and return
+        return tf.signal.irfft2d(xw_ft)

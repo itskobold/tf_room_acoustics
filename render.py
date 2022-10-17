@@ -10,48 +10,24 @@ mpl.use('Qt5Agg')
 
 # Class for rendering data
 class Renderer:
-    # Load data and metadata into renderer on init
     def __init__(self,
                  manager):
         self.manager = manager
 
     # Create impulse response from data and saves it if needed
+    # Takes (x, y) position in discretized space
     def get_impulse_response(self,
-                             xy_pos_real=None,
-                             xy_pos_sample=None,
-                             xy_pos_relative=None,
+                             data,
+                             xy_pos,
                              save=False,
                              file_name_out=None,
                              sample_rate=cfg.SAMPLE_RATE):
-
-        # No position given
-        if xy_pos_real is None \
-                and xy_pos_sample is None \
-                and xy_pos_relative is None:
-            print(f'No position given for impulse response measurement.')
-            return None
-
-        # Get sample points from real position
-        if xy_pos_real is not None:
-            x_pos = int(((xy_pos_real[0] + self.manager.fdtd.metadata['x_len'] / 2)
-                         / self.manager.fdtd.metadata['x_len']) * (self.manager.fdtd.metadata['x_len_samples'] - 1))
-            y_pos = int(((xy_pos_real[1] + self.manager.fdtd.metadata['y_len'] / 2)
-                         / self.manager.fdtd.metadata['y_len']) * (self.manager.fdtd.metadata['y_len_samples'] - 1))
-            suffix = f' (real position {xy_pos_real[0]}, {xy_pos_real[1]})'
-        # Get sample points from relative (0 to 1) position
-        elif xy_pos_relative is not None:
-            x_pos = int((self.manager.fdtd.metadata['x_len_samples'] - 1) * xy_pos_relative[0])
-            y_pos = int((self.manager.fdtd.metadata['y_len_samples'] - 1) * xy_pos_relative[1])
-            suffix = f' (relative position {xy_pos_relative[0]}, {xy_pos_relative[1]})'
-        # Get directly from sample points
-        else:
-            x_pos = xy_pos_sample[0]
-            y_pos = xy_pos_sample[1]
-            suffix = ''
-        print(f'Obtaining impulse response at {x_pos}, {y_pos}{suffix}...')
+        x_pos = xy_pos[0]
+        y_pos = xy_pos[1]
+        print(f'Obtaining impulse response at {x_pos}, {y_pos}...')
 
         # Create impulse response for x, y position
-        ir = self.manager.fdtd.data[x_pos, y_pos, :]
+        ir = data[x_pos, y_pos, :]
 
         # Normalise between (-1, 1), preserving zero crossings
         max_pt = 0
@@ -79,8 +55,8 @@ class Renderer:
 
     # Create animation from sound field data
     def animate_sound_field(self,
-                            file_name_out,
                             data,
+                            file_name_out,
                             colormap=cfg.COLORMAP,
                             fps=cfg.ANIM_FPS):
         # Do animation
@@ -93,23 +69,23 @@ class Renderer:
 
     # Animate absolute error between true and predicted solutions
     def animate_sound_field_error(self,
+                                  true_data,
+                                  pred_data,
                                   file_name_out,
                                   colormap=cfg.COLORMAP,
                                   fps=cfg.ANIM_FPS):
-        if self.manager.fdtd.data is None:
-            print("Couldn't animate absolute error: no FDTD data loaded in module.")
-        if self.manager.nn.data is None:
-            print("Couldn't animate absolute error: no prediction data loaded in module.")
         print("Animating absolute error between predicted and FDTD data.")
 
         # True and predicted data should be the same shapes
         # TODO: throw exception
-        true_shape = np.shape(self.manager.fdtd.data)
-        pred_shape = np.shape(self.manager.nn.data)
+        pred_shape = np.shape(pred_data)
+        td_diff = np.shape(true_data)[-1] - pred_shape[-1]
+        true_data = true_data[:, :, td_diff:]
+        true_shape = np.shape(true_data)
         assert true_shape == pred_shape
 
         # Do animation
-        anim = self.animation(data=np.subtract(self.manager.fdtd.data, self.manager.nn.data),
+        anim = self.animation(data=np.subtract(true_data, pred_data),
                               colormap=colormap,
                               fps=fps,
                               no_lim=True)
@@ -126,14 +102,15 @@ class Renderer:
 
         # Create figure
         fig = plt.figure(figsize=(8, 8))
-        x_len = self.manager.fdtd.metadata['x_len'] / 2
-        y_len = self.manager.fdtd.metadata['y_len'] / 2
 
         # Create image object
         lims = [None, None] if no_lim \
-            else [self.manager.fdtd.metadata['impulse_a'], -self.manager.fdtd.metadata['impulse_a']]
+            else [self.manager.impulse_a, -self.manager.impulse_a]
         im = plt.imshow(data[0], interpolation='bilinear', cmap=colormap,
-                        origin='lower', extent=[-x_len, x_len, -y_len, y_len],
+                        origin='lower', extent=[-self.manager.x_len,
+                                                self.manager.x_len,
+                                                -self.manager.y_len,
+                                                self.manager.x_len],
                         vmax=lims[0], vmin=lims[1])
 
         fig.colorbar(im, shrink=0.5, aspect=8)
