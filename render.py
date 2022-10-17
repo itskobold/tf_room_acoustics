@@ -4,7 +4,6 @@ import scipy.io.wavfile as wavf
 import matplotlib.pyplot as plt
 import matplotlib.animation as mpl_anim
 import matplotlib as mpl
-
 mpl.use('Qt5Agg')
 
 
@@ -105,12 +104,12 @@ class Renderer:
 
         # Create image object
         lims = [None, None] if no_lim \
-            else [self.manager.impulse_a, -self.manager.impulse_a]
+            else [self.manager.metadata["impulse_a"], -self.manager.metadata["impulse_a"]]
         im = plt.imshow(data[0], interpolation='bilinear', cmap=colormap,
-                        origin='lower', extent=[-self.manager.x_len,
-                                                self.manager.x_len,
-                                                -self.manager.y_len,
-                                                self.manager.x_len],
+                        origin='lower', extent=[-self.manager.metadata["x_len"],
+                                                self.manager.metadata["x_len"],
+                                                -self.manager.metadata["y_len"],
+                                                self.manager.metadata["y_len"]],
                         vmax=lims[0], vmin=lims[1])
 
         fig.colorbar(im, shrink=0.5, aspect=8)
