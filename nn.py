@@ -2,10 +2,13 @@ import config as cfg
 import numpy as np
 import tensorflow as tf
 import kormos
+from datetime import datetime
+from pathlib import Path
 import pickle
 import json
 
 
+# Class for managing neural networks for solving 2D acoustic wave equation
 class AcousticNet:
     def __init__(self,
                  manager):
@@ -21,52 +24,90 @@ class AcousticNet:
         self.val_y = None
         self.test_X = None
         self.test_y = None
-        self.input_shape = None
-        self.output_shape = None
+        self.metadata = {"history": {},
+                         "training_time": {}}
 
         print("Initializing neural network...")
 
         # Handle backend stuff
         tf.keras.backend.set_floatx(self.manager.metadata["dtype"])
 
-    # Load prediction data from file
-    def load_data(self, file_name):
-        with open(f"{self.manager.get_proj_path()}/{file_name}.pkl", "rb") as inp:
-            self.data = pickle.load(inp)
-        # with open(f'{self.manager.get_proj_path()}/{file_name}_meta.json', 'r') as inp:
-        #    self.metadata = json.load(inp)
+    # Load model and weights from file
+    def load_model(self,
+                   model_dir):
+        # Load model and weights
+        model_path = f"{self.manager.get_proj_path()}/models/{model_dir}/"
+        with open(f"{model_path}/model.json", "r") as inp:
+            model_json = json.load(inp)
+        self.model = tf.keras.models.model_from_json(model_json,
+                                                     custom_objects={"BatchOptimizedModel": kormos.models.BatchOptimizedModel,
+                                                                     "FourierLayer": FourierLayer})
+        self.model.load_weights(model_path)
 
-    # Saves prediction data and metadata
-    def save_data(self,
-                  file_name_out):
-        # Save prediction data
-        file_path = f"{self.manager.get_proj_path()}/{file_name_out}.pkl"
-        with open(file_path, "wb") as outp:
-            pickle.dump(self.data, outp, pickle.HIGHEST_PROTOCOL)
-        print(f'Saved prediction data to "{file_path}".\n')
+        # Load metadata
+        with open(f"{model_path}/meta.json", "r") as inp:
+            self.metadata = json.load(inp)
+        print(f"Loaded model, weights and metadata from '{model_path}'. "
+              f"Don't forget to compile before training!\n")
+
+    # Save model and weights to file
+    def save_model(self,
+                   model_dir):
+        # Make model & parent directory
+        model_path = f"{self.manager.get_proj_path()}/models/{model_dir}/"
+        Path(model_path).mkdir(parents=True, exist_ok=True)
+
+        # Save model and weights
+        model_json = self.model.to_json()
+        with open(f"{model_path}/model.json", "w") as outp:
+            json.dump(model_json, outp)
+        self.model.save_weights(filepath=model_path)
 
         # Save metadata
-        # file_path = f'{self.manager.get_proj_path()}/{file_name_out}_meta.json'
-        # with open(file_path, 'w') as outp:
-        #    json.dump(self.metadata, outp)
-        # print(f'Saved prediction metadata to "{file_path}".\n')
+        with open(f"{model_path}/meta.json", "w") as outp:
+            json.dump(self.metadata, outp)
 
-    # Init data from FDTD simulation
+        print(f"Saved model, weights and metadata to '{model_path}'.\n")
+
+    # Create datasets from data and set metadata parameters
     def init_data(self,
+                  data,
                   t_lookback=cfg.NN_T_LOOKBACK,
                   val_split=cfg.NN_VALIDATION_SPLIT,
                   test_split=cfg.NN_TEST_SPLIT):
-        if self.manager.fdtd.data is None:
-            print("Could not initialize neural network data: no FDTD data loaded in module.")
-
-        # Create training dataset
         self.train_X, self.train_y, \
         self.val_X, self.val_y, \
         self.test_X, self.test_y, \
-        self.input_shape, self.output_shape = \
-            self.create_datasets_from_fdtd_data(t_lookback=t_lookback,
-                                                val_split=val_split,
-                                                test_split=test_split)
+        self.metadata["dim_lengths_samples"], \
+        self.metadata["input_shape"], \
+        self.metadata["output_shape"] = \
+            self.create_datasets(data=data,
+                                 t_lookback=t_lookback,
+                                 val_split=val_split,
+                                 test_split=test_split)
+
+    # Init data from FDTD data loaded into module
+    def init_data_from_fdtd(self,
+                            t_lookback=cfg.NN_T_LOOKBACK,
+                            val_split=cfg.NN_VALIDATION_SPLIT,
+                            test_split=cfg.NN_TEST_SPLIT):
+        if self.manager.fdtd.data is None:
+            print("Could not initialize neural network data: no FDTD data loaded in module.")
+
+        self.init_data(data=self.manager.fdtd.data,
+                       t_lookback=t_lookback,
+                       val_split=val_split,
+                       test_split=test_split)
+
+    # Create training/validation/testing datasets from FDTD data
+    def create_datasets_from_fdtd_data(self,
+                                       t_lookback=cfg.NN_T_LOOKBACK,
+                                       val_split=cfg.NN_VALIDATION_SPLIT,
+                                       test_split=cfg.NN_TEST_SPLIT):
+        return self.create_datasets(data=self.manager.fdtd.data,
+                                    t_lookback=t_lookback,
+                                    val_split=val_split,
+                                    test_split=test_split)
 
     # Create training/validation/testing datasets from data
     @staticmethod
@@ -77,7 +118,7 @@ class AcousticNet:
         # Readability
         x_len_samples = data.shape[-3]
         y_len_samples = data.shape[-2]
-        td_len_samples = data.shape[-1]
+        t_len_samples = data.shape[-1]
         num_solutions = data.shape[0]
 
         # Create linearly spaced grid
@@ -86,8 +127,9 @@ class AcousticNet:
         xy_grid = np.stack([x_grid, y_grid], axis=-1)
 
         # Loop through all solutions in dataset
-        steps_to_predict = td_len_samples - t_lookback
-        a = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
+        steps_to_predict = t_len_samples - t_lookback
+        a = np.zeros(
+            [num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
         u = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
         for i, fdtd_sol in enumerate(data):
             # Loop through each solution and create training data for each time slice
@@ -99,32 +141,38 @@ class AcousticNet:
                 u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
 
         # Split datasets
+        # TODO: handle x_amt == 0
         val_amt = int(np.floor(num_solutions * val_split))
         test_amt = int(np.floor(num_solutions * test_split))
         train_amt = num_solutions - val_amt - test_amt
         assert val_amt + test_amt + train_amt == num_solutions
         train_X = a[:train_amt]
         train_y = u[:train_amt]
-        val_X = a[train_amt:train_amt + val_amt]
-        val_y = u[train_amt:train_amt + val_amt]
-        test_X = a[-test_amt:]
-        test_y = u[-test_amt:]
+        if val_amt > 0:
+            val_X = a[train_amt:train_amt + val_amt]
+            val_y = u[train_amt:train_amt + val_amt]
+        else:
+            val_X, val_y = None, None
+        if test_amt > 0:
+            test_X = a[-test_amt:]
+            test_y = u[-test_amt:]
+        else:
+            test_X, test_y = None, None
 
-        # Return split datasets and input/output shapes
+        # Return split datasets, dimension length in samples and input/output shapes
         return train_X, train_y, \
                val_X, val_y, \
                test_X, test_y, \
+               (x_len_samples, y_len_samples, steps_to_predict,), \
                a.shape[2:], u.shape[2:]
 
-    # Create training/validation/testing datasets from FDTD data
-    def create_datasets_from_fdtd_data(self,
-                                       t_lookback=cfg.NN_T_LOOKBACK,
-                                       val_split=cfg.NN_VALIDATION_SPLIT,
-                                       test_split=cfg.NN_TEST_SPLIT):
-        return self.create_datasets(data=self.manager.fdtd.data,
-                                    t_lookback=t_lookback,
-                                    val_split=val_split,
-                                    test_split=test_split)
+    # Saves prediction data and metadata
+    def save_prediction_data(self,
+                             file_name_out):
+        file_path = f"{self.manager.get_proj_path()}/{file_name_out}.pkl"
+        with open(file_path, "wb") as outp:
+            pickle.dump(self.data, outp, pickle.HIGHEST_PROTOCOL)
+        print(f'Saved prediction data as {file_path}".\n')
 
     # Wrapper to pass data into model, stacks individual simulations into one big block for batching
     @staticmethod
@@ -142,7 +190,7 @@ class AcousticNet:
         print("Initializing neural network model...")
 
         # Create layers
-        layers = [tf.keras.Input(self.input_shape)]
+        layers = [tf.keras.Input(self.metadata["input_shape"])]
 
         # Append up projection layer (linear, no activation)
         layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
@@ -165,7 +213,7 @@ class AcousticNet:
                                             activation=None)(layers[-1]))
 
         # Append output layer
-        layers.append(tf.keras.layers.Dense(self.output_shape[-1],
+        layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
                                             activation=None)(layers[-1]))
 
         # Create model and print summary
@@ -230,8 +278,9 @@ class AcousticNet:
         self.model.compile(optimizer=optimizer,
                            loss=loss)
 
-        # Begin training
+        # Begin training and start timer
         print("Starting training.")
+        t0 = datetime.now()
 
         if optimizer_mode == "adam":
             self.history = self.model.fit(self.pass_data_to_model(self.train_X),
@@ -250,7 +299,13 @@ class AcousticNet:
                                           method=optimizer_mode,
                                           options=options)
 
-        print("Training complete.\n")
+        # Add history and training time to metadata
+        training_time = datetime.now() - t0
+        num_entries = len(self.metadata["history"])
+        self.metadata["history"][f"{num_entries}_{optimizer_mode}"] = self.history.history
+        self.metadata["training_time"][f"{num_entries}_{optimizer_mode}"] = training_time.total_seconds() * 1000  # In MS
+        print(f"Training complete. "
+              f"Took {self.manager.util.timedelta_to_str(training_time)}.\n")
 
     # Get predictions for a dataset
     def get_predictions(self,
@@ -278,14 +333,13 @@ class FourierLayer(tf.keras.layers.Layer):
                  out_width=cfg.NN_HL_WIDTH,
                  drop_modes=cfg.NN_DROP_MODES,
                  modes=cfg.NN_MODES,
-                 batch_size=cfg.NN_BATCH_SIZE):
+                 **kwargs):
         super(FourierLayer, self).__init__()
         self.dtype_ = dtype
         self.in_width = in_width
         self.out_width = out_width
         self.drop_modes = drop_modes
         self.modes = modes
-        self.batch_size = batch_size
         self.scale = 1 / (self.in_width * self.out_width)
         self.w = None
         self.b = None
@@ -320,6 +374,7 @@ class FourierLayer(tf.keras.layers.Layer):
         xw_ft = tf.add(tf.multiply(x_ft, w_ft), b_ft)
 
         # Mask out Fourier modes as a regularisation measure
+        # TODO: fix? investigate
         if self.drop_modes:
             mask = np.zeros(w_ft.shape)
             ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
@@ -332,3 +387,14 @@ class FourierLayer(tf.keras.layers.Layer):
 
         # Inverse FFT and return
         return tf.signal.irfft2d(xw_ft)
+
+    # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
+    def get_config(self):
+        config = super().get_config().copy()
+        config.update({
+            'in_width': self.in_width,
+            'out_width': self.out_width,
+            'drop_modes': self.drop_modes,
+            'modes': self.modes
+        })
+        return config

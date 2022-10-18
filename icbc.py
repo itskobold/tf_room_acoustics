@@ -31,10 +31,21 @@ class ICBC:
                      prev_p,
                      x, y,
                      inversion=True):
+        if side == "left":
+            side_id = 0
+        elif side == "right":
+            side_id = 1
+        elif side == "bottom":
+            side_id = 2
+        elif side == "top":
+            side_id = 3
+        else:
+            return
+
         rt2 = np.sqrt(2.0)
-        a0 = rt2 / (rt2 + boundary_abs[side])
-        a1 = 1 / (2.0 + (rt2 * boundary_abs[side]))
-        a2 = (boundary_abs[side] - rt2) / (boundary_abs[side] + rt2)
+        a0 = rt2 / (rt2 + boundary_abs[side_id])
+        a1 = 1 / (2.0 + (rt2 * boundary_abs[side_id]))
+        a2 = (boundary_abs[side_id] - rt2) / (boundary_abs[side_id] + rt2)
 
         if inversion:
             inv = -1

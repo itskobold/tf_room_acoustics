@@ -16,9 +16,7 @@ class ProjectManager:
     def __init__(self,
                  proj_name,
                  seed=cfg.NN_SEED,
-                 x_len=cfg.X_LEN,
-                 y_len=cfg.Y_LEN,
-                 td_len=cfg.TD_LEN,
+                 dim_lengths=cfg.DIM_LENGTHS,
                  c=cfg.C,
                  impulse_a=cfg.IMPULSE_A,
                  impulse_r=cfg.IMPULSE_R,
@@ -44,9 +42,7 @@ class ProjectManager:
             print(f"Creating new project '{self.proj_name}'...")
             Path(proj_path).mkdir(parents=True, exist_ok=True)
             self.metadata = {"seed": seed,
-                             "x_len": x_len,
-                             "y_len": y_len,
-                             "td_len": td_len,
+                             "dim_lengths": dim_lengths,
                              "c": c,
                              "impulse_a": impulse_a,
                              "impulse_r": impulse_r,

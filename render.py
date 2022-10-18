@@ -58,6 +58,8 @@ class Renderer:
                             file_name_out,
                             colormap=cfg.COLORMAP,
                             fps=cfg.ANIM_FPS):
+        print(f"Animating sound field '{file_name_out}'.")
+
         # Do animation
         anim = self.animation(data=data,
                               colormap=colormap,
@@ -73,10 +75,9 @@ class Renderer:
                                   file_name_out,
                                   colormap=cfg.COLORMAP,
                                   fps=cfg.ANIM_FPS):
-        print("Animating absolute error between predicted and FDTD data.")
+        print(f"Animating absolute error between true and predicted data '{file_name_out}'.")
 
         # True and predicted data should be the same shapes
-        # TODO: throw exception
         pred_shape = np.shape(pred_data)
         td_diff = np.shape(true_data)[-1] - pred_shape[-1]
         true_data = true_data[:, :, td_diff:]
@@ -105,11 +106,10 @@ class Renderer:
         # Create image object
         lims = [None, None] if no_lim \
             else [self.manager.metadata["impulse_a"], -self.manager.metadata["impulse_a"]]
+        x_len = self.manager.metadata["dim_lengths"][0]
+        y_len = self.manager.metadata["dim_lengths"][1]
         im = plt.imshow(data[0], interpolation='bilinear', cmap=colormap,
-                        origin='lower', extent=[-self.manager.metadata["x_len"],
-                                                self.manager.metadata["x_len"],
-                                                -self.manager.metadata["y_len"],
-                                                self.manager.metadata["y_len"]],
+                        origin='lower', extent=[-x_len, x_len, -y_len, y_len],
                         vmax=lims[0], vmin=lims[1])
 
         fig.colorbar(im, shrink=0.5, aspect=8)
@@ -143,7 +143,7 @@ class Renderer:
                               sample_rate=cfg.SAMPLE_RATE):
         # Save as .wav
         wavf.write(f'{self.manager.get_proj_path()}/{file_name_out}.wav', sample_rate, ir)
-        print(f'Saved impulse response as "{file_name_out}.wav".\n')
+        print(f"Saved impulse response as '{file_name_out}.wav'.\n")
 
     # Save animation as .mp4 file
     def save_animation(self,
@@ -154,4 +154,4 @@ class Renderer:
         anim.save(file_path,
                   fps=fps,
                   extra_args=['-vcodec', 'libx264'])
-        print(f'Saved animation to "{file_path}".\n')
+        print(f"Saved animation as '{file_path}'.\n")
