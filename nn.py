@@ -8,29 +8,26 @@ import json
 
 class AcousticNet:
     def __init__(self,
-                 manager,
-                 seed=None,
-                 dtype=cfg.DTYPE):
+                 manager):
         self.manager = manager
-        self.seed = seed
-        self.dtype = dtype
 
         # Init variables
         self.model = None
         self.history = None
         self.data = None
-        self.dataset = None
-        self.padding = None
+        self.train_X = None
+        self.train_y = None
+        self.val_X = None
+        self.val_y = None
+        self.test_X = None
+        self.test_y = None
         self.input_shape = None
         self.output_shape = None
 
         print("Initializing neural network...")
 
         # Handle backend stuff
-        tf.keras.backend.set_floatx(self.dtype)
-        if self.seed is not None:
-            tf.random.set_seed(self.seed)
-            np.random.seed(self.seed)
+        tf.keras.backend.set_floatx(self.manager.metadata["dtype"])
 
     # Load prediction data from file
     def load_data(self, file_name):
@@ -46,7 +43,7 @@ class AcousticNet:
         file_path = f"{self.manager.get_proj_path()}/{file_name_out}.pkl"
         with open(file_path, "wb") as outp:
             pickle.dump(self.data, outp, pickle.HIGHEST_PROTOCOL)
-        print(f'Saved prediction data to "{file_path}".')
+        print(f'Saved prediction data to "{file_path}".\n')
 
         # Save metadata
         # file_path = f'{self.manager.get_proj_path()}/{file_name_out}_meta.json'
@@ -57,57 +54,84 @@ class AcousticNet:
     # Init data from FDTD simulation
     def init_data(self,
                   t_lookback=cfg.NN_T_LOOKBACK,
-                  batch_size=cfg.NN_BATCH_SIZE):
+                  val_split=cfg.NN_VALIDATION_SPLIT,
+                  test_split=cfg.NN_TEST_SPLIT):
         if self.manager.fdtd.data is None:
             print("Could not initialize neural network data: no FDTD data loaded in module.")
 
         # Create training dataset
-        self.dataset, self.input_shape, self.output_shape = \
-            self.create_training_data_from_fdtd_data(t_lookback=t_lookback,
-                                                     batch_size=batch_size)
+        self.train_X, self.train_y, \
+        self.val_X, self.val_y, \
+        self.test_X, self.test_y, \
+        self.input_shape, self.output_shape = \
+            self.create_datasets_from_fdtd_data(t_lookback=t_lookback,
+                                                val_split=val_split,
+                                                test_split=test_split)
 
-    # Create dataset from data
+    # Create training/validation/testing datasets from data
     @staticmethod
-    def create_dataset(data,
-                       t_lookback=cfg.NN_T_LOOKBACK,
-                       batch_size=cfg.NN_BATCH_SIZE):
+    def create_datasets(data,
+                        t_lookback=cfg.NN_T_LOOKBACK,
+                        val_split=cfg.NN_VALIDATION_SPLIT,
+                        test_split=cfg.NN_TEST_SPLIT):
         # Readability
         x_len_samples = data.shape[-3]
         y_len_samples = data.shape[-2]
         td_len_samples = data.shape[-1]
+        num_solutions = data.shape[0]
 
         # Create linearly spaced grid
         x_grid, y_grid = np.meshgrid(np.linspace(0, 1, x_len_samples),
                                      np.linspace(0, 1, y_len_samples))
         xy_grid = np.stack([x_grid, y_grid], axis=-1)
 
-        # Loop through all solutions in data set
+        # Loop through all solutions in dataset
         steps_to_predict = td_len_samples - t_lookback
-        a = np.zeros([steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
-        u = np.zeros([steps_to_predict, x_len_samples, y_len_samples, 1])
-        for fdtd_sol in data:
+        a = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
+        u = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
+        for i, fdtd_sol in enumerate(data):
             # Loop through each solution and create training data for each time slice
-            for i in range(steps_to_predict):
+            for t in range(steps_to_predict):
                 # Split data tensor and add to buffers (a, u)
                 # Also add (x, y) coordinate to feature labels a
-                a[i, :, :, :t_lookback] = fdtd_sol[:, :, i:t_lookback + i]
-                a[i, :, :, t_lookback:] = xy_grid
-                u[i] = np.expand_dims(fdtd_sol[:, :, t_lookback + i], axis=-1)
+                a[i, t, :, :, :t_lookback] = fdtd_sol[:, :, t:t_lookback + t]
+                a[i, t, :, :, t_lookback:] = xy_grid
+                u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
 
-        # Convert to tensors
-        dataset = tf.data.Dataset.from_tensor_slices((a, u)).batch(batch_size=batch_size,
-                                                                   drop_remainder=False)
+        # Split datasets
+        val_amt = int(np.floor(num_solutions * val_split))
+        test_amt = int(np.floor(num_solutions * test_split))
+        train_amt = num_solutions - val_amt - test_amt
+        assert val_amt + test_amt + train_amt == num_solutions
+        train_X = a[:train_amt]
+        train_y = u[:train_amt]
+        val_X = a[train_amt:train_amt + val_amt]
+        val_y = u[train_amt:train_amt + val_amt]
+        test_X = a[-test_amt:]
+        test_y = u[-test_amt:]
 
-        # Return split data tensors and input/output shapes
-        return dataset, a.shape[1:], u.shape[1:]
+        # Return split datasets and input/output shapes
+        return train_X, train_y, \
+               val_X, val_y, \
+               test_X, test_y, \
+               a.shape[2:], u.shape[2:]
 
-    # Create training data from FDTD data
-    def create_training_data_from_fdtd_data(self,
-                                            t_lookback=cfg.NN_T_LOOKBACK,
-                                            batch_size=cfg.NN_BATCH_SIZE):
-        return self.create_dataset(data=self.manager.fdtd.data,
-                                   t_lookback=t_lookback,
-                                   batch_size=batch_size)
+    # Create training/validation/testing datasets from FDTD data
+    def create_datasets_from_fdtd_data(self,
+                                       t_lookback=cfg.NN_T_LOOKBACK,
+                                       val_split=cfg.NN_VALIDATION_SPLIT,
+                                       test_split=cfg.NN_TEST_SPLIT):
+        return self.create_datasets(data=self.manager.fdtd.data,
+                                    t_lookback=t_lookback,
+                                    val_split=val_split,
+                                    test_split=test_split)
+
+    # Wrapper to pass data into model, stacks individual simulations into one big block for batching
+    @staticmethod
+    def pass_data_to_model(data):
+        shape = np.shape(data)
+        new_shape = (shape[0] * shape[1],) + shape[2:]
+        return np.reshape(data, new_shape)
 
     # Create tensorflow model
     def init_model(self,
@@ -119,14 +143,15 @@ class AcousticNet:
 
         # Create layers
         layers = [tf.keras.Input(self.input_shape)]
-#
+
         # Append up projection layer (linear, no activation)
         layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
 
         # Append FNO layers
         for i in range(num_hidden_layers):
             last_layer = layers[-1]
-            fourier_layer = FourierLayer(in_width=width,
+            fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
+                                         in_width=width,
                                          out_width=width,
                                          drop_modes=drop_modes,
                                          modes=modes)(last_layer)
@@ -209,42 +234,53 @@ class AcousticNet:
         print("Starting training.")
 
         if optimizer_mode == "adam":
-            self.history = self.model.fit(self.dataset,
-                                          batch_size=batch_size,
-                                          epochs=iterations)
-        else:
-            self.history = self.model.fit(self.dataset,
+            self.history = self.model.fit(self.pass_data_to_model(self.train_X),
+                                          self.pass_data_to_model(self.train_y),
                                           batch_size=batch_size,
                                           epochs=iterations,
+                                          validation_data=(self.pass_data_to_model(self.val_X),
+                                                           self.pass_data_to_model(self.val_y)))
+        else:
+            self.history = self.model.fit(self.pass_data_to_model(self.train_X),
+                                          self.pass_data_to_model(self.train_y),
+                                          batch_size=batch_size,
+                                          epochs=iterations,
+                                          validation_data=(self.pass_data_to_model(self.val_X),
+                                                           self.pass_data_to_model(self.val_y)),
                                           method=optimizer_mode,
                                           options=options)
 
-    # Get predictions for a data set
-    def get_prediction(self,
-                       data,
-                       batch_size=cfg.NN_BATCH_SIZE):
-        # Prepare dataset from data
-        dataset, in_shape, out_shape = self.create_dataset(data)
-        assert in_shape == self.input_shape
-        assert out_shape == self.output_shape
+        print("Training complete.\n")
+
+    # Get predictions for a dataset
+    def get_predictions(self,
+                        test_X,
+                        batch_size=cfg.NN_BATCH_SIZE):
+        print("Obtaining predictions for data...")
 
         # Get prediction
-        raw = self.model.predict(dataset,
+        num_simulations = np.shape(test_X)[0]
+        raw = self.model.predict(self.pass_data_to_model(test_X),
                                  batch_size=batch_size)
 
-        # Transpose to match source
-        self.data = np.transpose(np.squeeze(raw), (1, 2, 0))
+        # Transpose and reshape to match source
+        raw_shape = np.shape(raw)[:-1]
+        new_shape = (num_simulations, int(raw_shape[0] / num_simulations),) + raw_shape[1:]
+        self.data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
+        print("Predictions obtained.\n")
 
 
 # Fourier neural operator layer
 class FourierLayer(tf.keras.layers.Layer):
     def __init__(self,
+                 dtype,
                  in_width=cfg.NN_HL_WIDTH,
                  out_width=cfg.NN_HL_WIDTH,
                  drop_modes=cfg.NN_DROP_MODES,
                  modes=cfg.NN_MODES,
                  batch_size=cfg.NN_BATCH_SIZE):
         super(FourierLayer, self).__init__()
+        self.dtype_ = dtype
         self.in_width = in_width
         self.out_width = out_width
         self.drop_modes = drop_modes
@@ -260,19 +296,19 @@ class FourierLayer(tf.keras.layers.Layer):
 
         # Initialize weights
         w_init = self.scale * tf.random.uniform(shape=weight_shape,
-                                                dtype=self.dtype)
+                                                dtype=self.dtype_)
         self.w = tf.Variable(name="kernel",
                              initial_value=w_init,
                              trainable=True,
-                             dtype=self.dtype)
+                             dtype=self.dtype_)
 
         # Initialize biases
         b_init = tf.zeros_initializer()(shape=weight_shape,
-                                        dtype=self.dtype)
+                                        dtype=self.dtype_)
         self.b = tf.Variable(name="bias",
                              initial_value=b_init,
                              trainable=True,
-                             dtype=self.dtype)
+                             dtype=self.dtype_)
 
     def call(self, inputs):
         # Fourier transform on inputs, weights and bias weights

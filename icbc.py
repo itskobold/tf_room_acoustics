@@ -18,9 +18,8 @@ class ICBC:
     # All coordinates are in real space (meters)
     def gaussian_ic(self,
                     x, y,
-                    impulse_x=cfg.IMPULSE_X,
-                    impulse_y=cfg.IMPULSE_Y):
-        top_half = (x - impulse_x) ** 2 + (y - impulse_y) ** 2
+                    impulse_xy):
+        top_half = (x - impulse_xy[0]) ** 2 + (y - impulse_xy[1]) ** 2
         bottom_half = 2 * self.manager.metadata["impulse_r"] ** 2
         return self.manager.metadata["impulse_a"] * np.e ** -(top_half / bottom_half)
 

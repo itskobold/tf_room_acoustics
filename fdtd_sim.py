@@ -10,19 +10,11 @@ class FDTD:
     # Init FDTD settings
     def __init__(self,
                  manager,
-                 boundary_abs=cfg.BOUNDARY_ABS,
                  f_max=cfg.FDTD_F_MAX,
-                 ppw=cfg.FDTD_PPW,
-                 impulse_x=cfg.IMPULSE_X,
-                 impulse_y=cfg.IMPULSE_Y,
-                 num_solutions=cfg.FDTD_NUM_SOLUTIONS):
+                 ppw=cfg.FDTD_PPW):
         self.manager = manager
-        self.boundary_abs = boundary_abs
         self.f_max = f_max
         self.ppw = ppw
-        self.impulse_x = impulse_x
-        self.impulse_y = impulse_y
-        self.num_solutions = num_solutions
 
         # Placeholder variables
         self.data = None
@@ -55,7 +47,13 @@ class FDTD:
         print(f"Saved FDTD metadata to '{file_path}'.\n")
 
     # Run acoustic finite-difference time domain simulation
-    def run(self):
+    def run(self,
+            ic_positions,
+            bc_abs_coeffs):
+        # Generate solutions for each IC and BC passed
+        num_ic_positions = np.shape(ic_positions)[0]
+        num_solutions = num_ic_positions * len(bc_abs_coeffs)
+
         # Get grid spacing and system sample rate
         grid_spacing = self.manager.metadata["c"] / self.f_max / self.ppw
         dt = np.sqrt(0.5) * grid_spacing / self.manager.metadata["c"]
@@ -67,7 +65,7 @@ class FDTD:
         self.td_len_samples = int(np.ceil(self.manager.metadata["td_len"] / dt))
 
         # Init empty array
-        self.data = np.zeros([self.num_solutions,
+        self.data = np.zeros([num_solutions,
                               self.x_len_samples,
                               self.y_len_samples,
                               self.td_len_samples])
@@ -83,95 +81,98 @@ class FDTD:
         b = lmb ** 2
         c = -1
 
-        # Start timer
-        t0 = time.time()
+        # Start timer for entire computation
+        t0_all = time.time()
 
         # Loop for number of solutions to be generated
-        for solution_index in range(self.num_solutions):
-            pressure = self.data[solution_index]
+        for ic_index in range(num_ic_positions):
+            for bc_index in range(len(bc_abs_coeffs)):
+                solution_index = ic_index + bc_index
+                pressure = self.data[solution_index]
 
-            # Apply initial condition to pressure matrix at time step 0
-            for x_ in range(self.x_len_samples):
-                for y_ in range(self.y_len_samples):
-                    x_val = x_ / self.x_len_samples * self.manager.metadata["x_len"]
-                    y_val = y_ / self.y_len_samples * self.manager.metadata["y_len"]
-                    x_val -= self.manager.metadata["x_len"] / 2
-                    y_val -= self.manager.metadata["y_len"] / 2
-                    pressure[x_, y_, 0] = self.manager.icbc.gaussian_ic(x_val, y_val,
-                                                                        impulse_x=self.impulse_x,
-                                                                        impulse_y=self.impulse_y)
-            # Run simulation
-            print("Running FDTD simulation", end='')
-            for step in range(1, self.td_len_samples - 1):
-                if (step - 1) % cfg.ANIM_FPS == 0:
-                    print(".", end='')
+                # Apply initial condition to pressure matrix at time step 0
+                for x_ in range(self.x_len_samples):
+                    for y_ in range(self.y_len_samples):
+                        x_val = x_ / self.x_len_samples * self.manager.metadata["x_len"]
+                        y_val = y_ / self.y_len_samples * self.manager.metadata["y_len"]
+                        x_val -= self.manager.metadata["x_len"] / 2
+                        y_val -= self.manager.metadata["y_len"] / 2
+                        pressure[x_, y_, 0] = self.manager.icbc.gaussian_ic(x_val, y_val,
+                                                                            impulse_xy=ic_positions[ic_index])
+                # Run simulation
+                print(f"Running FDTD simulation: ic_index = {ic_index}, bc_index = {bc_index}....", end='')
 
-                # Create matrices for readability
-                prev_p = pressure[:, :, step - 1]
-                current_p = pressure[:, :, step]
-                next_p = pressure[:, :, step + 1]
+                # Start timer for this simulation
+                t0 = time.time()
+                for step in range(1, self.td_len_samples - 1):
+                    if (step - 1) % cfg.ANIM_FPS == 0:
+                        print(".", end='')
 
-                # FD process
-                # TODO: use slices to make this more efficient/tidier, GPU implementation
-                for x in range(self.x_len_samples):
-                    for y in range(self.y_len_samples):
-                        # Bottom left corner
-                        if x == 0 and y == 0:
-                            next_p[x, y] = 0
-                        # Bottom right corner
-                        elif x == self.x_len_samples - 1 and y == 0:
-                            next_p[x, y] = 0
-                        # Top left corner
-                        elif x == 0 and y == self.y_len_samples - 1:
-                            next_p[x, y] = 0
-                        # Top right corner
-                        elif x == self.x_len_samples - 1 and y == self.y_len_samples - 1:
-                            next_p[x, y] = 0
-                        # Left boundary
-                        elif x == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("left",
-                                                                          self.boundary_abs,
-                                                                          current_p,
-                                                                          prev_p,
-                                                                          x, y)
-                        # Right boundary
-                        elif x == self.x_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("right",
-                                                                          self.boundary_abs,
-                                                                          current_p,
-                                                                          prev_p,
-                                                                          x, y)
-                        # Bottom boundary
-                        elif y == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("bottom",
-                                                                          self.boundary_abs,
-                                                                          current_p,
-                                                                          prev_p,
-                                                                          x, y)
-                        # Top boundary
-                        elif y == self.y_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("top",
-                                                                          self.boundary_abs,
-                                                                          current_p,
-                                                                          prev_p,
-                                                                          x, y)
-                        # Within domain
-                        if x != 0 and x != self.x_len_samples - 1 and y != 0 and y != self.y_len_samples - 1:
-                            next_p[x, y] = a * current_p[x, y] + \
-                                           b * (current_p[x + 1, y] + current_p[x - 1, y] +
-                                                current_p[x, y + 1] + current_p[x, y - 1]) + \
-                                           c * prev_p[x, y]
+                    # Create matrices for readability
+                    prev_p = pressure[:, :, step - 1]
+                    current_p = pressure[:, :, step]
+                    next_p = pressure[:, :, step + 1]
 
-                # Set pressure values for next time step
-                pressure[:, :, step + 1] = next_p
+                    # FD process
+                    # TODO: use slices to make this more efficient/tidier, GPU implementation
+                    for x in range(self.x_len_samples):
+                        for y in range(self.y_len_samples):
+                            # Bottom left corner
+                            if x == 0 and y == 0:
+                                next_p[x, y] = 0
+                            # Bottom right corner
+                            elif x == self.x_len_samples - 1 and y == 0:
+                                next_p[x, y] = 0
+                            # Top left corner
+                            elif x == 0 and y == self.y_len_samples - 1:
+                                next_p[x, y] = 0
+                            # Top right corner
+                            elif x == self.x_len_samples - 1 and y == self.y_len_samples - 1:
+                                next_p[x, y] = 0
+                            # Left boundary
+                            elif x == 0:
+                                next_p[x, y] = self.manager.icbc.absorbing_bc("left",
+                                                                              boundary_abs=bc_abs_coeffs[bc_index],
+                                                                              current_p=current_p,
+                                                                              prev_p=prev_p,
+                                                                              x=x, y=y)
+                            # Right boundary
+                            elif x == self.x_len_samples - 1:
+                                next_p[x, y] = self.manager.icbc.absorbing_bc("right",
+                                                                              boundary_abs=bc_abs_coeffs[bc_index],
+                                                                              current_p=current_p,
+                                                                              prev_p=prev_p,
+                                                                              x=x, y=y)
+                            # Bottom boundary
+                            elif y == 0:
+                                next_p[x, y] = self.manager.icbc.absorbing_bc("bottom",
+                                                                              boundary_abs=bc_abs_coeffs[bc_index],
+                                                                              current_p=current_p,
+                                                                              prev_p=prev_p,
+                                                                              x=x, y=y)
+                            # Top boundary
+                            elif y == self.y_len_samples - 1:
+                                next_p[x, y] = self.manager.icbc.absorbing_bc("top",
+                                                                              boundary_abs=bc_abs_coeffs[bc_index],
+                                                                              current_p=current_p,
+                                                                              prev_p=prev_p,
+                                                                              x=x, y=y)
+                            # Within domain
+                            if x != 0 and x != self.x_len_samples - 1 and y != 0 and y != self.y_len_samples - 1:
+                                next_p[x, y] = a * current_p[x, y] + \
+                                               b * (current_p[x + 1, y] + current_p[x - 1, y] +
+                                                    current_p[x, y + 1] + current_p[x, y - 1]) + \
+                                               c * prev_p[x, y]
 
-            # Save pressure matrix and metadata
-            self.data[solution_index] = pressure
-            self.metadata[solution_index] = {"boundary_abs": self.boundary_abs,
-                                             "impulse_x": self.impulse_x,
-                                             "impulse_y": self.impulse_y}
+                    # Set pressure values for next time step
+                    pressure[:, :, step + 1] = next_p
 
-        # Stop timer
-        self.computation_time = (time.time() - t0) * 1000
-        print("done.")
-        print(f"FDTD simulation time: {round(self.computation_time, 2)}ms.")
+                # Save pressure matrix and metadata
+                self.data[solution_index] = pressure
+                self.metadata[solution_index] = {"impulse_xy": ic_positions[ic_index].tolist(),
+                                                 "boundary_abs": bc_abs_coeffs[bc_index]}
+                print(f"done. Took {round((time.time() - t0) * 1000)}ms.")
+
+        # Stop timer for entire computation
+        self.computation_time = (time.time() - t0_all) * 1000
+        print(f"Total FDTD simulation time: {round(self.computation_time, 2)}ms.\n")

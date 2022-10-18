@@ -113,7 +113,7 @@ class Renderer:
                         vmax=lims[0], vmin=lims[1])
 
         fig.colorbar(im, shrink=0.5, aspect=8)
-        print('Creating animation', end='')
+        print('Creating animation...', end='')
 
         # Function to loop through pressure matrix and update plot data
         num_frames = np.shape(data)[-1]
