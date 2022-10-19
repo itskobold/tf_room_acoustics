@@ -1,6 +1,7 @@
 import config as cfg
 import numpy as np
 from datetime import datetime
+from sklearn.utils import shuffle
 import pickle
 import json
 
@@ -85,7 +86,7 @@ class FDTD:
         # Loop for number of solutions to be generated
         for ic_index in range(num_ic_positions):
             for bc_index in range(num_bc_coeffs):
-                solution_index = ic_index * num_ic_positions + bc_index
+                solution_index = ic_index * num_bc_coeffs + bc_index
                 pressure = self.data[solution_index]
 
                 # Apply initial condition to pressure matrix at time step 0
@@ -99,7 +100,7 @@ class FDTD:
                                                                             impulse_xy=ic_positions[ic_index])
                 # Run simulation
                 print(f"Running FDTD simulation: IC {ic_index + 1}/{num_ic_positions},"
-                      f" BC = {bc_index + 1}/{num_bc_coeffs}...", end='')
+                      f" BC = {bc_index + 1}/{num_bc_coeffs}", end='')
 
                 # Start timer for this simulation
                 t0 = datetime.now()
@@ -179,3 +180,7 @@ class FDTD:
         self.metadata["computation_time"] = timedelta.total_seconds() * 1000
         print(f"Total FDTD simulation time: "
               f"{self.manager.util.timedelta_to_str(timedelta)}.\n")
+
+        # Shuffle order of simulations
+        self.data = shuffle(self.data,
+                            random_state=self.manager.metadata["seed"])

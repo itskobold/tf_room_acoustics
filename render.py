@@ -1,5 +1,6 @@
 import numpy as np
 import config as cfg
+from pathlib import Path
 import scipy.io.wavfile as wavf
 import matplotlib.pyplot as plt
 import matplotlib.animation as mpl_anim
@@ -64,6 +65,7 @@ class Renderer:
         anim = self.animation(data=data,
                               colormap=colormap,
                               fps=fps)
+        print('done.')
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -89,6 +91,7 @@ class Renderer:
                               colormap=colormap,
                               fps=fps,
                               no_lim=True)
+        print('done.')
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -98,6 +101,7 @@ class Renderer:
                   data,
                   colormap=cfg.COLORMAP,
                   fps=cfg.ANIM_FPS,
+                  max_frames=cfg.MAX_FRAMES,
                   no_lim=False):
 
         # Create figure
@@ -113,16 +117,13 @@ class Renderer:
                         vmax=lims[0], vmin=lims[1])
 
         fig.colorbar(im, shrink=0.5, aspect=8)
-        print('Creating animation...', end='')
+        print('Creating animation.', end='')
 
         # Function to loop through pressure matrix and update plot data
-        num_frames = np.shape(data)[-1]
-
+        num_frames = max_frames if np.shape(data)[-1] > max_frames else np.shape(data)[-1]
         def animate_func(t):
             if t % fps == 0:
                 print('.', end='')
-            elif t == num_frames - 1:
-                print('done.')
 
             im.set_array(np.swapaxes(data[:, :, t], 0, 1))  # We need to swap axes here for some reason
             return [im]
@@ -141,8 +142,12 @@ class Renderer:
                               file_name_out,
                               ir,
                               sample_rate=cfg.SAMPLE_RATE):
+        # Make impulse response folder
+        ir_path = f"{self.manager.get_proj_path()}/ir/"
+        Path(ir_path).mkdir(parents=True, exist_ok=True)
+
         # Save as .wav
-        wavf.write(f'{self.manager.get_proj_path()}/{file_name_out}.wav', sample_rate, ir)
+        wavf.write(f'{ir_path}{file_name_out}.wav', sample_rate, ir)
         print(f"Saved impulse response as '{file_name_out}.wav'.\n")
 
     # Save animation as .mp4 file
@@ -150,7 +155,12 @@ class Renderer:
                        file_name_out,
                        anim,
                        fps=cfg.ANIM_FPS):
-        file_path = f'{self.manager.get_proj_path()}/{file_name_out}.mp4'
+        # Make anim folder
+        anim_path = f"{self.manager.get_proj_path()}/anim/"
+        Path(anim_path).mkdir(parents=True, exist_ok=True)
+
+        # Save animation
+        file_path = f'{anim_path}{file_name_out}.mp4'
         anim.save(file_path,
                   fps=fps,
                   extra_args=['-vcodec', 'libx264'])

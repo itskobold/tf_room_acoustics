@@ -15,11 +15,9 @@ if LOAD_FDTD:
     manager.fdtd.load_data("fdtd")
 else:
     ic_positions = manager.util.sample_collocation_points()
-    ic_positions[-1] = (0, 0)
     bc_coeffs = manager.util.sample_boundary_absorption_coeffs()
-    bc_coeffs[-1] = (0.5, 0.5, 0.5, 0.5)
     manager.fdtd.run(ic_positions=ic_positions,
-                     bc_abs_coeffs=bc_coeffs)  # TODO: take Nx4 array
+                     bc_abs_coeffs=bc_coeffs)
     manager.fdtd.save_data(file_name_out="fdtd")
 
 # Init neural network
@@ -32,10 +30,10 @@ if LOAD_MODEL:
 else:
     manager.nn.fit_model(optimizer_mode="adam")
     manager.nn.fit_model(optimizer_mode="l-bfgs-b")
-    manager.nn.save_model("model")
+    manager.nn.save_model(model_name_out="model")
 
 # Get predictions and save data
-manager.nn.get_predictions(test_X=manager.nn.test_X)
+manager.nn.get_predictions_for_test_data()
 manager.nn.save_prediction_data(file_name_out="pred")
 
 num_simulations = np.shape(manager.fdtd.data)[0]

@@ -2,6 +2,7 @@ import config as cfg
 import numpy as np
 import tensorflow as tf
 import kormos
+from sklearn.utils import shuffle
 from datetime import datetime
 from pathlib import Path
 import pickle
@@ -40,8 +41,9 @@ class AcousticNet:
         with open(f"{model_path}/model.json", "r") as inp:
             model_json = json.load(inp)
         self.model = tf.keras.models.model_from_json(model_json,
-                                                     custom_objects={"BatchOptimizedModel": kormos.models.BatchOptimizedModel,
-                                                                     "FourierLayer": FourierLayer})
+                                                     custom_objects={
+                                                         "BatchOptimizedModel": kormos.models.BatchOptimizedModel,
+                                                         "FourierLayer": FourierLayer})
         self.model.load_weights(model_path)
 
         # Load metadata
@@ -52,9 +54,9 @@ class AcousticNet:
 
     # Save model and weights to file
     def save_model(self,
-                   model_dir):
+                   model_name_out):
         # Make model & parent directory
-        model_path = f"{self.manager.get_proj_path()}/models/{model_dir}/"
+        model_path = f"{self.manager.get_proj_path()}/models/{model_name_out}/"
         Path(model_path).mkdir(parents=True, exist_ok=True)
 
         # Save model and weights
@@ -109,9 +111,9 @@ class AcousticNet:
                                     val_split=val_split,
                                     test_split=test_split)
 
-    # Create training/validation/testing datasets from data
-    @staticmethod
-    def create_datasets(data,
+    # Create training/validation/testing datasets from an array of simulations
+    def create_datasets(self,
+                        data,
                         t_lookback=cfg.NN_T_LOOKBACK,
                         val_split=cfg.NN_VALIDATION_SPLIT,
                         test_split=cfg.NN_TEST_SPLIT):
@@ -176,10 +178,12 @@ class AcousticNet:
 
     # Wrapper to pass data into model, stacks individual simulations into one big block for batching
     @staticmethod
-    def pass_data_to_model(data):
+    def prepare_dataset_for_model(data):
         shape = np.shape(data)
         new_shape = (shape[0] * shape[1],) + shape[2:]
-        return np.reshape(data, new_shape)
+        data_reshaped = np.reshape(data, new_shape)
+
+        return data_reshaped
 
     # Create tensorflow model
     def init_model(self,
@@ -227,7 +231,8 @@ class AcousticNet:
                   optimizer_mode,
                   options=None,
                   iterations=None,
-                  batch_size=cfg.NN_BATCH_SIZE):
+                  batch_size=cfg.NN_BATCH_SIZE,
+                  big_batch_size=cfg.NN_BIG_BATCH_SIZE):
         print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
 
         # Using ADAM optimizer
@@ -278,48 +283,106 @@ class AcousticNet:
         self.model.compile(optimizer=optimizer,
                            loss=loss)
 
+        # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
+        train_X = self.prepare_dataset_for_model(self.train_X)
+        train_y = self.prepare_dataset_for_model(self.train_y)
+        train_X, train_y, = shuffle(train_X, train_y,
+                                    random_state=self.manager.metadata["seed"])
+        num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
+
+        # Do the same for validation data (if any exists)
+        if self.val_X is not None and self.val_y is not None:
+            use_val = True
+            val_X = self.prepare_dataset_for_model(self.val_X)
+            val_y = self.prepare_dataset_for_model(self.val_y)
+            val_X, val_y = shuffle(val_X, val_y,
+                                   random_state=self.manager.metadata["seed"])
+            big_batch_size_val = int(np.floor(np.shape(val_X)[0] / num_big_batches))
+        else:
+            use_val, val_X, val_y, big_batch_size_val = False, None, None, None
+
         # Begin training and start timer
         print("Starting training.")
         t0 = datetime.now()
 
-        if optimizer_mode == "adam":
-            self.history = self.model.fit(self.pass_data_to_model(self.train_X),
-                                          self.pass_data_to_model(self.train_y),
-                                          batch_size=batch_size,
-                                          epochs=iterations,
-                                          validation_data=(self.pass_data_to_model(self.val_X),
-                                                           self.pass_data_to_model(self.val_y)))
-        else:
-            self.history = self.model.fit(self.pass_data_to_model(self.train_X),
-                                          self.pass_data_to_model(self.train_y),
-                                          batch_size=batch_size,
-                                          epochs=iterations,
-                                          validation_data=(self.pass_data_to_model(self.val_X),
-                                                           self.pass_data_to_model(self.val_y)),
-                                          method=optimizer_mode,
-                                          options=options)
+        # Loop through big batches
+        for big_batch in range(num_big_batches):
+            print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
+            end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
+
+            # Prepare validation data
+            if use_val:
+                end_val = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size_val
+                val_data = (val_X[big_batch * big_batch_size_val:end_val],
+                            val_y[big_batch * big_batch_size_val:end_val])
+            else:
+                val_data = None
+
+            if optimizer_mode == "adam":
+                self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
+                                              train_y[big_batch * big_batch_size:end],
+                                              batch_size=batch_size,
+                                              epochs=iterations,
+                                              validation_data=val_data)
+            else:
+                self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
+                                              train_y[big_batch * big_batch_size:end],
+                                              batch_size=batch_size,
+                                              epochs=iterations,
+                                              validation_data=val_data,
+                                              method=optimizer_mode,
+                                              options=options)
 
         # Add history and training time to metadata
         training_time = datetime.now() - t0
         num_entries = len(self.metadata["history"])
         self.metadata["history"][f"{num_entries}_{optimizer_mode}"] = self.history.history
-        self.metadata["training_time"][f"{num_entries}_{optimizer_mode}"] = training_time.total_seconds() * 1000  # In MS
+        self.metadata["training_time"][
+            f"{num_entries}_{optimizer_mode}"] = training_time.total_seconds() * 1000  # In MS
         print(f"Training complete. "
               f"Took {self.manager.util.timedelta_to_str(training_time)}.\n")
 
-    # Get predictions for a dataset
+    # Obtain predictions for test data loaded in this module
+    def get_predictions_for_test_data(self,
+                                      batch_size=cfg.NN_BATCH_SIZE,
+                                      big_batch_size=cfg.NN_BIG_BATCH_SIZE):
+        if self.test_X is None or self.test_y is None:
+            print("Could not get predictions from test data:"
+                  "module test_X and test_y are None.")
+            return
+
+        self.get_predictions(test_X=self.test_X,
+                             test_y=self.test_y,
+                             batch_size=batch_size,
+                             big_batch_size=big_batch_size)
+
+    # Get predictions for a dataset test_X and store in this module's data buffer
+    # TODO: evaluate against test_Y if not none
     def get_predictions(self,
                         test_X,
-                        batch_size=cfg.NN_BATCH_SIZE):
+                        test_y=None,
+                        batch_size=cfg.NN_BATCH_SIZE,
+                        big_batch_size=cfg.NN_BIG_BATCH_SIZE):
         print("Obtaining predictions for data...")
 
-        # Get prediction
+        # Prepare test_X data
         num_simulations = np.shape(test_X)[0]
-        raw = self.model.predict(self.pass_data_to_model(test_X),
-                                 batch_size=batch_size)
+        test_X_ = self.prepare_dataset_for_model(test_X)
 
-        # Transpose and reshape to match source
-        raw_shape = np.shape(raw)[:-1]
+        # Predict in big batches
+        num_big_batches = int(np.ceil(np.shape(test_X_)[0] / big_batch_size))
+        shape = np.shape(test_X_)[:-1]
+        raw = np.zeros(shape)
+        for big_batch in range(num_big_batches):
+            print(f"Predicting big batch {big_batch + 1}/{num_big_batches}...\n")
+
+            # Get prediction, drop extra dimension, store in buffer
+            end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
+            pred = self.model.predict(test_X_[big_batch * big_batch_size:end], batch_size=batch_size)
+            raw[big_batch * big_batch_size:end] = np.squeeze(pred, axis=-1)
+
+        # Transpose and reshape full buffer to an array of individual solutions
+        raw_shape = np.shape(raw)
         new_shape = (num_simulations, int(raw_shape[0] / num_simulations),) + raw_shape[1:]
         self.data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
         print("Predictions obtained.\n")
