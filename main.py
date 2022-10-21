@@ -60,7 +60,7 @@ if RENDER_IRS:
     xy_pos_real = [0.5, 0.25]
     for test_index in range(num_simulations):
         xy_pos = manager.util.real_to_sample_pos(xy_pos_real,
-                                                 dim_lengths_samples=manager.fdtd.metadata["dim_lengths_samples"])
+                                                 dim_lengths_samples=fdtd_meta["dim_lengths_samples"])
         manager.renderer.get_impulse_response(data=test_data[test_index],
                                               xy_pos=xy_pos,
                                               save=True,
