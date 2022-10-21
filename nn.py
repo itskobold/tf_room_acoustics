@@ -1,12 +1,11 @@
 import config as cfg
+import util
 import numpy as np
 import tensorflow as tf
 import kormos
 from sklearn.utils import shuffle
 from datetime import datetime
 from pathlib import Path
-import pickle
-import json
 
 
 # Class for managing neural networks for solving 2D acoustic wave equation
@@ -18,7 +17,7 @@ class AcousticNet:
         # Init variables
         self.model = None
         self.history = None
-        self.data = None
+        self.t_lookback = None
         self.train_X = None
         self.train_y = None
         self.val_X = None
@@ -28,18 +27,164 @@ class AcousticNet:
         self.metadata = {"history": {},
                          "training_time": {}}
 
-        print("Initializing neural network...")
-
         # Handle backend stuff
         tf.keras.backend.set_floatx(self.manager.metadata["dtype"])
+
+    # Train from simulation data in a directory split into numbered blocks
+    # This is the only function that needs to be called when initializing a new network
+    # Optimizer mode can be 'adam' or 'l-bfgs-b'
+    def fit_model(self,
+                  train_data_dir,
+                  num_files,
+                  optimizer_mode,
+                  t_lookback=cfg.NN_T_LOOKBACK,
+                  options=None,
+                  iterations=None,
+                  batch_size=cfg.NN_BATCH_SIZE,
+                  big_batch_size=cfg.NN_BIG_BATCH_SIZE,
+                  num_passes=cfg.NN_NUM_PASSES,
+                  num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
+                  width=cfg.NN_HL_WIDTH,
+                  drop_modes=cfg.NN_DROP_MODES,
+                  modes=cfg.NN_MODES):
+        print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
+
+        # Initialize data and model if not already initialized
+        self.metadata["t_lookback"] = t_lookback
+        self.init_data(util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/0.pkl"))
+        if self.model is None:
+            self.init_model(num_hidden_layers=num_hidden_layers,
+                            width=width,
+                            drop_modes=drop_modes,
+                            modes=modes)
+
+        # Using ADAM optimizer
+        if optimizer_mode == "adam":
+            # Load default options from config if none specified
+            if options is None:
+                options = {"learning_rate": cfg.NN_LEARNING_RATE,
+                           "lr_decay": cfg.NN_LR_DECAY,
+                           "decay_steps": cfg.NN_LR_DECAY_STEPS,
+                           "decay_rate": cfg.NN_LR_DECAY_RATE}
+
+            # Same for number of iterations
+            if iterations is None:
+                iterations = cfg.NN_ITERATIONS_ADAM
+
+            # Set learning rate
+            if options["lr_decay"]:
+                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
+                                                                    decay_steps=options["decay_steps"],
+                                                                    decay_rate=options["decay_rate"])
+            else:
+                lr = options["learning_rate"]
+
+            # Set optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+        # Using L-BFGS-B optimizer
+        elif optimizer_mode == "l-bfgs-b":
+            # Load default options from config if none specified
+            if options is None:
+                options = {"maxcor": cfg.NN_MAXCOR,
+                           "gtol": cfg.NN_GTOL}
+
+            # Same for number of iterations
+            if iterations is None:
+                iterations = cfg.NN_ITERATIONS_L_BFGS_B
+
+            # Set optimizer
+            optimizer = kormos.optimizers.ScipyBatchOptimizer()
+
+        # Incorrect mode specified
+        else:
+            print(f"Optimizer mode '{optimizer_mode}' unrecognised, quitting training.")
+            return
+
+        # Define loss function and compile
+        loss = tf.keras.losses.MeanSquaredError()
+        self.model.compile(optimizer=optimizer,
+                           loss=loss)
+
+        # Loop over numerous passes so entire dataset is passed through relatively evenly
+        # as learning rate decays over time
+        t0 = datetime.now()
+        for pass_num in range(num_passes):
+            print(f"Beginning training pass {pass_num + 1}/{num_passes}.")
+            # Loop through all files to train from
+            for file_num in range(num_files):
+                print(f"Training on data block {file_num}...")
+
+                # Load data from file
+                if file_num > 0:
+                    self.init_data(util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/{file_num}.pkl"))
+
+                # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
+                train_X = self.prepare_dataset_for_model(self.train_X)
+                train_y = self.prepare_dataset_for_model(self.train_y)
+                train_X, train_y, = shuffle(train_X, train_y,
+                                            random_state=self.manager.metadata["seed"])
+                num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
+
+                # Do the same for validation data (if any exists)
+                if self.val_X is not None and self.val_y is not None:
+                    use_val = True
+                    val_X = self.prepare_dataset_for_model(self.val_X)
+                    val_y = self.prepare_dataset_for_model(self.val_y)
+                    val_X, val_y = shuffle(val_X, val_y,
+                                           random_state=self.manager.metadata["seed"])
+                    big_batch_size_val = int(np.floor(np.shape(val_X)[0] / num_big_batches))
+                else:
+                    use_val, val_X, val_y, big_batch_size_val = False, None, None, None
+
+                # Loop through big batches
+                for big_batch in range(num_big_batches):
+                    print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
+                    end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
+
+                    # Prepare validation data
+                    if use_val:
+                        end_val = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size_val
+                        val_data = (val_X[big_batch * big_batch_size_val:end_val],
+                                    val_y[big_batch * big_batch_size_val:end_val])
+                    else:
+                        val_data = None
+
+                    if optimizer_mode == "adam":
+                        self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
+                                                      train_y[big_batch * big_batch_size:end],
+                                                      batch_size=batch_size,
+                                                      epochs=iterations,
+                                                      validation_data=val_data)
+                    else:
+                        self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
+                                                      train_y[big_batch * big_batch_size:end],
+                                                      batch_size=batch_size,
+                                                      epochs=iterations,
+                                                      validation_data=val_data,
+                                                      method=optimizer_mode,
+                                                      options=options)
+
+                # Add history to metadata
+                self.metadata["history"][f"{len(self.metadata['history'])}_{optimizer_mode}"] = \
+                    self.history.history
+
+        # Add training time to metadata
+        training_time = datetime.now() - t0
+        self.metadata["training_time"][
+            f"{len(self.metadata['history'])}_{optimizer_mode}"] = \
+            training_time.total_seconds() * 1000  # In MS
+
+        # All done
+        print(f"Training complete. "
+              f"Took {self.manager.util.timedelta_to_str(training_time)}.\n")
 
     # Load model and weights from file
     def load_model(self,
                    model_dir):
         # Load model and weights
-        model_path = f"{self.manager.get_proj_path()}/models/{model_dir}/"
-        with open(f"{model_path}/model.json", "r") as inp:
-            model_json = json.load(inp)
+        model_path = f"{self.manager.get_proj_path()}models/{model_dir}/"
+        model_json = util.load_json(f"{model_path}/model.json")
         self.model = tf.keras.models.model_from_json(model_json,
                                                      custom_objects={
                                                          "BatchOptimizedModel": kormos.models.BatchOptimizedModel,
@@ -47,8 +192,7 @@ class AcousticNet:
         self.model.load_weights(model_path)
 
         # Load metadata
-        with open(f"{model_path}/meta.json", "r") as inp:
-            self.metadata = json.load(inp)
+        self.metadata = util.load_json(f"{model_path}/meta.json")
         print(f"Loaded model, weights and metadata from '{model_path}'. "
               f"Don't forget to compile before training!\n")
 
@@ -56,72 +200,40 @@ class AcousticNet:
     def save_model(self,
                    model_name_out):
         # Make model & parent directory
-        model_path = f"{self.manager.get_proj_path()}/models/{model_name_out}/"
+        model_path = f"{self.manager.get_proj_path()}models/{model_name_out}/"
         Path(model_path).mkdir(parents=True, exist_ok=True)
 
         # Save model and weights
-        model_json = self.model.to_json()
-        with open(f"{model_path}/model.json", "w") as outp:
-            json.dump(model_json, outp)
+        util.save_json(f"{model_path}/model.json", self.model.to_json())
         self.model.save_weights(filepath=model_path)
 
         # Save metadata
-        with open(f"{model_path}/meta.json", "w") as outp:
-            json.dump(self.metadata, outp)
+        util.save_json(f"{model_path}/meta.json", self.metadata)
 
         print(f"Saved model, weights and metadata to '{model_path}'.\n")
 
     # Create datasets from data and set metadata parameters
     def init_data(self,
                   data,
-                  t_lookback=cfg.NN_T_LOOKBACK,
-                  val_split=cfg.NN_VALIDATION_SPLIT,
-                  test_split=cfg.NN_TEST_SPLIT):
+                  val_split=cfg.NN_VALIDATION_SPLIT):
         self.train_X, self.train_y, \
         self.val_X, self.val_y, \
-        self.test_X, self.test_y, \
         self.metadata["dim_lengths_samples"], \
         self.metadata["input_shape"], \
         self.metadata["output_shape"] = \
             self.create_datasets(data=data,
-                                 t_lookback=t_lookback,
-                                 val_split=val_split,
-                                 test_split=test_split)
-
-    # Init data from FDTD data loaded into module
-    def init_data_from_fdtd(self,
-                            t_lookback=cfg.NN_T_LOOKBACK,
-                            val_split=cfg.NN_VALIDATION_SPLIT,
-                            test_split=cfg.NN_TEST_SPLIT):
-        if self.manager.fdtd.data is None:
-            print("Could not initialize neural network data: no FDTD data loaded in module.")
-
-        self.init_data(data=self.manager.fdtd.data,
-                       t_lookback=t_lookback,
-                       val_split=val_split,
-                       test_split=test_split)
-
-    # Create training/validation/testing datasets from FDTD data
-    def create_datasets_from_fdtd_data(self,
-                                       t_lookback=cfg.NN_T_LOOKBACK,
-                                       val_split=cfg.NN_VALIDATION_SPLIT,
-                                       test_split=cfg.NN_TEST_SPLIT):
-        return self.create_datasets(data=self.manager.fdtd.data,
-                                    t_lookback=t_lookback,
-                                    val_split=val_split,
-                                    test_split=test_split)
+                                 val_split=val_split)
 
     # Create training/validation/testing datasets from an array of simulations
     def create_datasets(self,
                         data,
-                        t_lookback=cfg.NN_T_LOOKBACK,
-                        val_split=cfg.NN_VALIDATION_SPLIT,
-                        test_split=cfg.NN_TEST_SPLIT):
+                        val_split=cfg.NN_VALIDATION_SPLIT):
         # Readability
         x_len_samples = data.shape[-3]
         y_len_samples = data.shape[-2]
         t_len_samples = data.shape[-1]
         num_solutions = data.shape[0]
+        t_lookback = self.metadata["t_lookback"]
 
         # Create linearly spaced grid
         x_grid, y_grid = np.meshgrid(np.linspace(0, 1, x_len_samples),
@@ -143,11 +255,9 @@ class AcousticNet:
                 u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
 
         # Split datasets
-        # TODO: handle x_amt == 0
-        val_amt = int(np.floor(num_solutions * val_split))
-        test_amt = int(np.floor(num_solutions * test_split))
-        train_amt = num_solutions - val_amt - test_amt
-        assert val_amt + test_amt + train_amt == num_solutions
+        val_amt = int(np.ceil(num_solutions * val_split))
+        train_amt = num_solutions - val_amt
+        assert val_amt + train_amt == num_solutions
         train_X = a[:train_amt]
         train_y = u[:train_amt]
         if val_amt > 0:
@@ -155,25 +265,19 @@ class AcousticNet:
             val_y = u[train_amt:train_amt + val_amt]
         else:
             val_X, val_y = None, None
-        if test_amt > 0:
-            test_X = a[-test_amt:]
-            test_y = u[-test_amt:]
-        else:
-            test_X, test_y = None, None
 
         # Return split datasets, dimension length in samples and input/output shapes
         return train_X, train_y, \
                val_X, val_y, \
-               test_X, test_y, \
                (x_len_samples, y_len_samples, steps_to_predict,), \
                a.shape[2:], u.shape[2:]
 
-    # Saves prediction data and metadata
-    def save_prediction_data(self,
-                             file_name_out):
-        file_path = f"{self.manager.get_proj_path()}/{file_name_out}.pkl"
-        with open(file_path, "wb") as outp:
-            pickle.dump(self.data, outp, pickle.HIGHEST_PROTOCOL)
+    # Saves prediction data
+    def save_data(self,
+                  data,
+                  file_name_out):
+        file_path = f"{self.manager.get_proj_path()}{file_name_out}.pkl"
+        util.save_data(file_path, data)
         print(f'Saved prediction data as {file_path}".\n')
 
     # Wrapper to pass data into model, stacks individual simulations into one big block for batching
@@ -225,167 +329,49 @@ class AcousticNet:
                                                        outputs=layers[-1])
         self.model.summary()
 
-    # Set optimizer and compile model
-    # Mode can be 'adam' or 'l-bfgs-b'
-    def fit_model(self,
-                  optimizer_mode,
-                  options=None,
-                  iterations=None,
-                  batch_size=cfg.NN_BATCH_SIZE,
-                  big_batch_size=cfg.NN_BIG_BATCH_SIZE):
-        print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
-
-        # Using ADAM optimizer
-        if optimizer_mode == "adam":
-            # Load default options from config if none specified
-            if options is None:
-                options = {"learning_rate": cfg.NN_LEARNING_RATE,
-                           "lr_decay": cfg.NN_LR_DECAY,
-                           "decay_steps": cfg.NN_LR_DECAY_STEPS,
-                           "decay_rate": cfg.NN_LR_DECAY_RATE}
-
-            # Same for number of iterations
-            if iterations is None:
-                iterations = cfg.NN_ITERATIONS_ADAM
-
-            # Set learning rate
-            if options["lr_decay"]:
-                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
-                                                                    decay_steps=options["decay_steps"],
-                                                                    decay_rate=options["decay_rate"])
-            else:
-                lr = options["learning_rate"]
-
-            # Set optimizer
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-        # Using L-BFGS-B optimizer
-        elif optimizer_mode == "l-bfgs-b":
-            # Load default options from config if none specified
-            if options is None:
-                options = {"maxcor": cfg.NN_MAXCOR,
-                           "gtol": cfg.NN_GTOL}
-
-            # Same for number of iterations
-            if iterations is None:
-                iterations = cfg.NN_ITERATIONS_L_BFGS_B
-
-            # Set optimizer
-            optimizer = kormos.optimizers.ScipyBatchOptimizer()
-
-        # Incorrect mode specified
-        else:
-            print(f"Optimizer mode '{optimizer_mode}' unrecognised, quitting training.")
-            return
-
-        # Define loss function and compile
-        loss = tf.keras.losses.MeanSquaredError()
-        self.model.compile(optimizer=optimizer,
-                           loss=loss)
-
-        # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
-        train_X = self.prepare_dataset_for_model(self.train_X)
-        train_y = self.prepare_dataset_for_model(self.train_y)
-        train_X, train_y, = shuffle(train_X, train_y,
-                                    random_state=self.manager.metadata["seed"])
-        num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
-
-        # Do the same for validation data (if any exists)
-        if self.val_X is not None and self.val_y is not None:
-            use_val = True
-            val_X = self.prepare_dataset_for_model(self.val_X)
-            val_y = self.prepare_dataset_for_model(self.val_y)
-            val_X, val_y = shuffle(val_X, val_y,
-                                   random_state=self.manager.metadata["seed"])
-            big_batch_size_val = int(np.floor(np.shape(val_X)[0] / num_big_batches))
-        else:
-            use_val, val_X, val_y, big_batch_size_val = False, None, None, None
-
-        # Begin training and start timer
-        print("Starting training.")
-        t0 = datetime.now()
-
-        # Loop through big batches
-        for big_batch in range(num_big_batches):
-            print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
-            end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
-
-            # Prepare validation data
-            if use_val:
-                end_val = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size_val
-                val_data = (val_X[big_batch * big_batch_size_val:end_val],
-                            val_y[big_batch * big_batch_size_val:end_val])
-            else:
-                val_data = None
-
-            if optimizer_mode == "adam":
-                self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
-                                              train_y[big_batch * big_batch_size:end],
-                                              batch_size=batch_size,
-                                              epochs=iterations,
-                                              validation_data=val_data)
-            else:
-                self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
-                                              train_y[big_batch * big_batch_size:end],
-                                              batch_size=batch_size,
-                                              epochs=iterations,
-                                              validation_data=val_data,
-                                              method=optimizer_mode,
-                                              options=options)
-
-        # Add history and training time to metadata
-        training_time = datetime.now() - t0
-        num_entries = len(self.metadata["history"])
-        self.metadata["history"][f"{num_entries}_{optimizer_mode}"] = self.history.history
-        self.metadata["training_time"][
-            f"{num_entries}_{optimizer_mode}"] = training_time.total_seconds() * 1000  # In MS
-        print(f"Training complete. "
-              f"Took {self.manager.util.timedelta_to_str(training_time)}.\n")
-
-    # Obtain predictions for test data loaded in this module
-    def get_predictions_for_test_data(self,
-                                      batch_size=cfg.NN_BATCH_SIZE,
-                                      big_batch_size=cfg.NN_BIG_BATCH_SIZE):
-        if self.test_X is None or self.test_y is None:
-            print("Could not get predictions from test data:"
-                  "module test_X and test_y are None.")
-            return
-
-        self.get_predictions(test_X=self.test_X,
-                             test_y=self.test_y,
-                             batch_size=batch_size,
-                             big_batch_size=big_batch_size)
-
-    # Get predictions for a dataset test_X and store in this module's data buffer
+    # Get predictions for a block of simulation data
+    # Saves if file_name is not None
     # TODO: evaluate against test_Y if not none
     def get_predictions(self,
-                        test_X,
-                        test_y=None,
+                        data,
+                        file_name_out=None,
                         batch_size=cfg.NN_BATCH_SIZE,
                         big_batch_size=cfg.NN_BIG_BATCH_SIZE):
-        print("Obtaining predictions for data...")
+        print(f"Obtaining predictions...")
+
+        # Create test X and y datasets
+        test_X, test_y, _, _, _, _, _ = self.create_datasets(data=data,
+                                                             val_split=0)
 
         # Prepare test_X data
         num_simulations = np.shape(test_X)[0]
-        test_X_ = self.prepare_dataset_for_model(test_X)
+        test_X = self.prepare_dataset_for_model(test_X)
 
         # Predict in big batches
-        num_big_batches = int(np.ceil(np.shape(test_X_)[0] / big_batch_size))
-        shape = np.shape(test_X_)[:-1]
+        num_big_batches = int(np.ceil(np.shape(test_X)[0] / big_batch_size))
+        shape = np.shape(test_X)[:-1]
         raw = np.zeros(shape)
         for big_batch in range(num_big_batches):
             print(f"Predicting big batch {big_batch + 1}/{num_big_batches}...\n")
 
             # Get prediction, drop extra dimension, store in buffer
             end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
-            pred = self.model.predict(test_X_[big_batch * big_batch_size:end], batch_size=batch_size)
+            pred = self.model.predict(test_X[big_batch * big_batch_size:end], batch_size=batch_size)
             raw[big_batch * big_batch_size:end] = np.squeeze(pred, axis=-1)
 
         # Transpose and reshape full buffer to an array of individual solutions
         raw_shape = np.shape(raw)
         new_shape = (num_simulations, int(raw_shape[0] / num_simulations),) + raw_shape[1:]
-        self.data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
+        data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
         print("Predictions obtained.\n")
+
+        # Save data
+        if file_name_out is not None:
+            self.save_data(data,
+                           file_name_out=file_name_out)
+
+        # Return predicted data
+        return data
 
 
 # Fourier neural operator layer
@@ -436,17 +422,24 @@ class FourierLayer(tf.keras.layers.Layer):
         # Multiply Fourier modes with transformed weight matrix and add bias
         xw_ft = tf.add(tf.multiply(x_ft, w_ft), b_ft)
 
-        # Mask out Fourier modes as a regularisation measure
+        # Drop Fourier modes as a regularization measure
         # TODO: fix? investigate
         if self.drop_modes:
-            mask = np.zeros(w_ft.shape)
-            ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
-            mask[:self.modes, :self.modes, :] = ones
-            mask[-self.modes:, :self.modes, :] = ones
-            mask[:self.modes, -self.modes:, :] = ones
-            mask[-self.modes:, -self.modes:, :] = ones
-            mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
-            xw_ft = tf.multiply(xw_ft, mask_tf)
+            xw_ft_m = np.zeros([self.modes * 2, self.modes * 2, w_ft.shape[-1]])
+            xw_ft_m[:self.modes, :self.modes] = xw_ft[:self.modes, :self.modes]
+            xw_ft_m[-self.modes:, :self.modes] = xw_ft[-self.modes:, :self.modes]
+            xw_ft_m[:self.modes, -self.modes:] = xw_ft[:self.modes, -self.modes:]
+            xw_ft_m[-self.modes:, -self.modes:] = xw_ft[-self.modes:, -self.modes:]
+            xw_ft = xw_ft_m
+
+            #mask = np.zeros(w_ft.shape)
+            #ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
+            #mask[:self.modes, :self.modes, :] = ones
+            #mask[-self.modes:, :self.modes, :] = ones
+            #mask[:self.modes, -self.modes:, :] = ones
+            #mask[-self.modes:, -self.modes:, :] = ones
+            #mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
+            #xw_ft = tf.multiply(xw_ft, mask_tf)
 
         # Inverse FFT and return
         return tf.signal.irfft2d(xw_ft)

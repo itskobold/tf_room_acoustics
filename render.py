@@ -65,7 +65,6 @@ class Renderer:
         anim = self.animation(data=data,
                               colormap=colormap,
                               fps=fps)
-        print('done.')
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -91,7 +90,6 @@ class Renderer:
                               colormap=colormap,
                               fps=fps,
                               no_lim=True)
-        print('done.')
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -143,7 +141,7 @@ class Renderer:
                               ir,
                               sample_rate=cfg.SAMPLE_RATE):
         # Make impulse response folder
-        ir_path = f"{self.manager.get_proj_path()}/ir/"
+        ir_path = f"{self.manager.get_proj_path()}ir/"
         Path(ir_path).mkdir(parents=True, exist_ok=True)
 
         # Save as .wav
@@ -156,7 +154,7 @@ class Renderer:
                        anim,
                        fps=cfg.ANIM_FPS):
         # Make anim folder
-        anim_path = f"{self.manager.get_proj_path()}/anim/"
+        anim_path = f"{self.manager.get_proj_path()}anim/"
         Path(anim_path).mkdir(parents=True, exist_ok=True)
 
         # Save animation
@@ -164,4 +162,5 @@ class Renderer:
         anim.save(file_path,
                   fps=fps,
                   extra_args=['-vcodec', 'libx264'])
+        print('done.')  # Finish string from anim loop
         print(f"Saved animation as '{file_path}'.\n")

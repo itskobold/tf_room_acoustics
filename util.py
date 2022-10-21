@@ -1,6 +1,7 @@
 import config as cfg
 from scipy.stats.qmc import LatinHypercube
-from datetime import datetime
+import json
+import pickle
 
 
 # Class of utility functions
@@ -58,3 +59,27 @@ class Util:
         hours, rem = divmod(timedelta.seconds, 3600)
         minutes, seconds = divmod(rem, 60)
         return f"{hours} hours, {minutes} mins, {seconds} secs"
+
+
+# Load .json from file
+def load_json(file_path):
+    with open(file_path, "r") as inp:
+        return json.load(inp)
+
+
+# Save .json to file
+def save_json(file_path, data):
+    with open(file_path, "w") as outp:
+        json.dump(data, outp)
+
+
+# Load .pkl from file
+def load_data(file_path):
+    with open(file_path, "rb") as inp:
+        return pickle.load(inp)
+
+
+# Save .pkl to file
+def save_data(file_path, data):
+    with open(file_path, "wb") as outp:
+        pickle.dump(data, outp, pickle.HIGHEST_PROTOCOL)

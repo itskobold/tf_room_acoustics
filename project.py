@@ -1,3 +1,4 @@
+import util
 from fdtd_sim import FDTD
 from render import Renderer
 from util import Util
@@ -5,7 +6,6 @@ from nn import AcousticNet
 from icbc import ICBC
 import config as cfg
 from pathlib import Path
-import json
 import tensorflow as tf
 import numpy as np
 
@@ -30,12 +30,10 @@ class ProjectManager:
         Path("projects/").mkdir(parents=True, exist_ok=True)
 
         # Load project metadata if project already exists
-        proj_path = f"projects/{self.proj_name}"
+        proj_path = f"projects/{self.proj_name}/"
         if Path(proj_path).exists():
             print(f"Loading project '{self.proj_name}'...")
-            with open(f"{proj_path}/proj_meta.json", "r") as inp:
-                self.metadata = json.load(inp)
-
+            self.metadata = util.load_json(f"{proj_path}meta.json")
             print(f"Project '{self.proj_name}' loaded.\n")
         # Otherwise make this new project directory and init metadata from args
         else:
@@ -48,9 +46,9 @@ class ProjectManager:
                              "impulse_r": impulse_r,
                              "dtype": dtype}
 
-            with open(f"{proj_path}/proj_meta.json", "w") as outp:
-                json.dump(self.metadata, outp)
-            print(f"Project '{self.proj_name}' created, metadata saved as '{proj_path}/proj_meta.json'.\n")
+            # Save metadata
+            util.save_json(f"{proj_path}meta.json", self.metadata)
+            print(f"Project '{self.proj_name}' created, metadata saved as '{proj_path}meta.json'.\n")
 
         # Init modules
         self.renderer = Renderer(self)
@@ -61,4 +59,4 @@ class ProjectManager:
 
     # Return path to this project folder
     def get_proj_path(self):
-        return f"projects/{self.proj_name}"
+        return f"projects/{self.proj_name}/"
