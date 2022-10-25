@@ -50,6 +50,11 @@ class ProjectManager:
             util.save_json(f"{proj_path}meta.json", self.metadata)
             print(f"Project '{self.proj_name}' created, metadata saved as '{proj_path}meta.json'.\n")
 
+        # Print metadata
+        print("Project metadata:")
+        print(self.metadata)
+        print("")
+
         # Init modules
         self.renderer = Renderer(self)
         self.fdtd = FDTD(self)

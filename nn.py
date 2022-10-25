@@ -16,7 +16,6 @@ class AcousticNet:
 
         # Init variables
         self.model = None
-        self.history = None
         self.t_lookback = None
         self.train_X = None
         self.train_y = None
@@ -24,8 +23,7 @@ class AcousticNet:
         self.val_y = None
         self.test_X = None
         self.test_y = None
-        self.metadata = {"history": {},
-                         "training_time": {}}
+        self.metadata = {}
 
         # Handle backend stuff
         tf.keras.backend.set_floatx(self.manager.metadata["dtype"])
@@ -107,17 +105,24 @@ class AcousticNet:
                            loss=loss)
 
         # Loop over numerous passes so entire dataset is passed through relatively evenly
-        # as learning rate decays over time
+        # as learning rate decays over time.
+        initial_epoch = 0
         t0 = datetime.now()
         for pass_num in range(num_passes):
             print(f"Beginning training pass {pass_num + 1}/{num_passes}.")
+
+            # Shuffle order of blocks
+            block_ids = np.arange(num_files)
+            block_ids = shuffle(block_ids)
+
             # Loop through all files to train from
             for file_num in range(num_files):
-                print(f"Training on data block {file_num}...")
+                print(f"Training on data block {block_ids[file_num]} "
+                      f"({file_num + 1}/{num_files})...")
 
                 # Load data from file
-                if file_num > 0:
-                    self.init_data(util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/{file_num}.pkl"))
+                self.init_data(
+                    util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/{block_ids[file_num]}.pkl"))
 
                 # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
                 train_X = self.prepare_dataset_for_model(self.train_X)
@@ -151,29 +156,25 @@ class AcousticNet:
                         val_data = None
 
                     if optimizer_mode == "adam":
-                        self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
-                                                      train_y[big_batch * big_batch_size:end],
-                                                      batch_size=batch_size,
-                                                      epochs=iterations,
-                                                      validation_data=val_data)
+                        self.model.fit(train_X[big_batch * big_batch_size:end],
+                                       train_y[big_batch * big_batch_size:end],
+                                       batch_size=batch_size,
+                                       epochs=iterations + initial_epoch,
+                                       initial_epoch=initial_epoch,
+                                       validation_data=val_data)
+                        initial_epoch += iterations
                     else:
-                        self.history = self.model.fit(train_X[big_batch * big_batch_size:end],
-                                                      train_y[big_batch * big_batch_size:end],
-                                                      batch_size=batch_size,
-                                                      epochs=iterations,
-                                                      validation_data=val_data,
-                                                      method=optimizer_mode,
-                                                      options=options)
-
-                # Add history to metadata
-                self.metadata["history"][f"{len(self.metadata['history'])}_{optimizer_mode}"] = \
-                    self.history.history
+                        self.model.fit(train_X[big_batch * big_batch_size:end],
+                                       train_y[big_batch * big_batch_size:end],
+                                       batch_size=batch_size,
+                                       epochs=iterations,
+                                       validation_data=val_data,
+                                       method=optimizer_mode,
+                                       options=options)
 
         # Add training time to metadata
         training_time = datetime.now() - t0
-        self.metadata["training_time"][
-            f"{len(self.metadata['history'])}_{optimizer_mode}"] = \
-            training_time.total_seconds() * 1000  # In MS
+        self.metadata["training_time"] = training_time.total_seconds() * 1000  # In MS
 
         # All done
         print(f"Training complete. "
@@ -193,8 +194,7 @@ class AcousticNet:
 
         # Load metadata
         self.metadata = util.load_json(f"{model_path}/meta.json")
-        print(f"Loaded model, weights and metadata from '{model_path}'. "
-              f"Don't forget to compile before training!\n")
+        print(f"Loaded model, weights and metadata from '{model_path}'.\n")
 
     # Save model and weights to file
     def save_model(self,
@@ -276,7 +276,7 @@ class AcousticNet:
     def save_data(self,
                   data,
                   file_name_out):
-        file_path = f"{self.manager.get_proj_path()}{file_name_out}.pkl"
+        file_path = f"{self.manager.get_proj_path()}pred/{file_name_out}.pkl"
         util.save_data(file_path, data)
         print(f'Saved prediction data as {file_path}".\n')
 
@@ -351,6 +351,7 @@ class AcousticNet:
         num_big_batches = int(np.ceil(np.shape(test_X)[0] / big_batch_size))
         shape = np.shape(test_X)[:-1]
         raw = np.zeros(shape)
+        t0 = datetime.now()
         for big_batch in range(num_big_batches):
             print(f"Predicting big batch {big_batch + 1}/{num_big_batches}...\n")
 
@@ -360,10 +361,13 @@ class AcousticNet:
             raw[big_batch * big_batch_size:end] = np.squeeze(pred, axis=-1)
 
         # Transpose and reshape full buffer to an array of individual solutions
+        t1 = datetime.now() - t0
+        t1_ms = round(t1.total_seconds() * 1000, 2)
         raw_shape = np.shape(raw)
         new_shape = (num_simulations, int(raw_shape[0] / num_simulations),) + raw_shape[1:]
         data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
-        print("Predictions obtained.\n")
+        print(f"Predictions obtained. Took {t1_ms}ms "
+              f"(average {round(t1_ms / num_simulations, 2)}ms per solution).\n")  # In MS
 
         # Save data
         if file_name_out is not None:
@@ -425,21 +429,29 @@ class FourierLayer(tf.keras.layers.Layer):
         # Drop Fourier modes as a regularization measure
         # TODO: fix? investigate
         if self.drop_modes:
-            xw_ft_m = np.zeros([self.modes * 2, self.modes * 2, w_ft.shape[-1]])
-            xw_ft_m[:self.modes, :self.modes] = xw_ft[:self.modes, :self.modes]
-            xw_ft_m[-self.modes:, :self.modes] = xw_ft[-self.modes:, :self.modes]
-            xw_ft_m[:self.modes, -self.modes:] = xw_ft[:self.modes, -self.modes:]
-            xw_ft_m[-self.modes:, -self.modes:] = xw_ft[-self.modes:, -self.modes:]
-            xw_ft = xw_ft_m
+            xw_ft_m = tf.zeros([self.modes * 2, self.modes * 2, w_ft.shape[-1]])
+            m_tl = xw_ft[:self.modes, :self.modes]
+            m_tr = xw_ft[-self.modes:, :self.modes]
+            m_bl = xw_ft[:self.modes, -self.modes:]
+            m_br = xw_ft[-self.modes:, -self.modes:]
+            m_t = tf.concat([m_tl, m_tr], axis=1)
+            m_b = tf.concat([m_bl, m_br], axis=1)
+            xw_ft = tf.concat([m_t, m_b], axis=0)
 
-            #mask = np.zeros(w_ft.shape)
-            #ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
-            #mask[:self.modes, :self.modes, :] = ones
-            #mask[-self.modes:, :self.modes, :] = ones
-            #mask[:self.modes, -self.modes:, :] = ones
-            #mask[-self.modes:, -self.modes:, :] = ones
-            #mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
-            #xw_ft = tf.multiply(xw_ft, mask_tf)
+            # xw_ft_m[:self.modes, :self.modes] = xw_ft[:self.modes, :self.modes]
+            # xw_ft_m[-self.modes:, :self.modes] = xw_ft[-self.modes:, :self.modes]
+            # xw_ft_m[:self.modes, -self.modes:] = xw_ft[:self.modes, -self.modes:]
+            # xw_ft_m[-self.modes:, -self.modes:] = xw_ft[-self.modes:, -self.modes:]
+            # xw_ft = xw_ft_m
+
+            # mask = np.zeros(w_ft.shape)
+            # ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
+            # mask[:self.modes, :self.modes, :] = ones
+            # mask[-self.modes:, :self.modes, :] = ones
+            # mask[:self.modes, -self.modes:, :] = ones
+            # mask[-self.modes:, -self.modes:, :] = ones
+            # mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
+            # xw_ft = tf.multiply(xw_ft, mask_tf)
 
         # Inverse FFT and return
         return tf.signal.irfft2d(xw_ft)
