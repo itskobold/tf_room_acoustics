@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-# Class for managing neural networks for solving 2D acoustic wave equation
+# Class for managing neural networks for solving 2D acoustic wave equation.
 class AcousticNet:
     def __init__(self,
                  manager):
@@ -16,93 +16,121 @@ class AcousticNet:
 
         # Init variables
         self.model = None
-        self.t_lookback = None
         self.train_X = None
         self.train_y = None
         self.val_X = None
         self.val_y = None
-        self.test_X = None
-        self.test_y = None
         self.metadata = {}
 
         # Handle backend stuff
         tf.keras.backend.set_floatx(self.manager.metadata["dtype"])
 
-    # Train from simulation data in a directory split into numbered blocks
-    # This is the only function that needs to be called when initializing a new network
-    # Optimizer mode can be 'adam' or 'l-bfgs-b'
+    # Load model and weights from file.
+    def load_model(self,
+                   model_dir):
+        # Load model and weights
+        model_path = f"{self.manager.get_proj_path()}models/{model_dir}/"
+        model_json = util.load_json(f"{model_path}/model.json")
+        self.model = tf.keras.models.model_from_json(model_json,
+                                                     custom_objects={
+                                                         "BatchOptimizedModel": kormos.models.BatchOptimizedModel,
+                                                         "FourierLayer": FourierLayer})
+        self.model.load_weights(model_path)
+
+        # Load metadata
+        self.metadata = util.load_json(f"{model_path}/meta.json")
+        print(f"Loaded model, weights and metadata from '{model_path}'.\n")
+
+    # Save model and weights to file.
+    def save_model(self,
+                   model_name_out):
+        # Make model & parent directory
+        model_path = f"{self.manager.get_proj_path()}models/{model_name_out}/"
+        Path(model_path).mkdir(parents=True, exist_ok=True)
+
+        # Save model and weights
+        util.save_json(f"{model_path}/model.json", self.model.to_json())
+        self.model.save_weights(filepath=model_path)
+
+        # Save metadata
+        util.save_json(f"{model_path}/meta.json", self.metadata)
+
+        print(f"Saved model, weights and metadata to '{model_path}'.\n")
+
+    # Create a new Tensorflow model.
+    def init_model(self,
+                   input_shape,
+                   output_shape,
+                   num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
+                   width=cfg.NN_HL_WIDTH,
+                   t_lookback=cfg.FNO_T_LOOKBACK,
+                   drop_modes=cfg.FNO_DROP_MODES,
+                   modes=cfg.FNO_MODES):
+        print("Initializing neural network model...")
+
+        # Set metadata parameters
+        self.metadata["input_shape"] = input_shape
+        self.metadata["output_shape"] = output_shape
+        self.metadata["t_lookback"] = t_lookback
+
+        # Print warning if t_lookback is too short to capture first order reflections from boundaries for sure
+        if self.metadata["input_shape"][0] > t_lookback or \
+                self.metadata["input_shape"][1] > t_lookback:
+            print("\nWARNING: t_lookback might be too short to capture first order reflections from all boundaries! "
+                  f"t_lookback = {self.metadata['t_lookback']}, "
+                  f"input_shape (X, Y) = {self.metadata['input_shape'][:2]}.")
+
+        # Create layers
+        layers = [tf.keras.Input(self.metadata["input_shape"])]
+
+        # Append up projection layer (linear, no activation)
+        layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
+
+        # Append FNO layers
+        for i in range(num_hidden_layers):
+            last_layer = layers[-1]
+            fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
+                                         in_width=width,
+                                         out_width=width,
+                                         drop_modes=drop_modes,
+                                         modes=modes)(last_layer)
+            conv = tf.keras.layers.Conv2D(filters=width,
+                                          kernel_size=1)(last_layer)
+            layers.append(tf.keras.layers.Add()([fourier_layer, conv]))
+            layers.append(tf.keras.layers.Lambda(lambda x: tf.keras.activations.gelu(x))(layers[-1]))
+
+        # Append down projection layer (linear, no activation)
+        layers.append(tf.keras.layers.Dense(128,
+                                            activation=None)(layers[-1]))
+
+        # Append output layer
+        layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
+                                            activation=None)(layers[-1]))
+
+        # Create model and print summary
+        self.model = kormos.models.BatchOptimizedModel(inputs=layers[0],
+                                                       outputs=layers[-1])
+        self.model.summary()
+
+    # Train from simulation data in a directory split into numbered blocks.
+    # Remember to create a model with init_model or load one with load_model before fitting.
+    # Optimizer mode can be "adam" or "l-bfgs-b".
     def fit_model(self,
                   train_data_dir,
                   num_files,
-                  optimizer_mode,
-                  t_lookback=cfg.NN_T_LOOKBACK,
+                  optimizer_mode=cfg.NN_OPTIMIZER,
+                  iterations=cfg.NN_ITERATIONS,
                   options=None,
-                  iterations=None,
                   batch_size=cfg.NN_BATCH_SIZE,
                   big_batch_size=cfg.NN_BIG_BATCH_SIZE,
-                  num_passes=cfg.NN_NUM_PASSES,
-                  num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
-                  width=cfg.NN_HL_WIDTH,
-                  drop_modes=cfg.NN_DROP_MODES,
-                  modes=cfg.NN_MODES):
-        print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
+                  num_passes=cfg.NN_NUM_PASSES):
+        # Get default options if none specified
+        if options is None:
+            options = self.get_default_options(optimizer_mode)
 
-        # Initialize data and model if not already initialized
-        self.metadata["t_lookback"] = t_lookback
-        self.init_data(util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/0.pkl"))
-        if self.model is None:
-            self.init_model(num_hidden_layers=num_hidden_layers,
-                            width=width,
-                            drop_modes=drop_modes,
-                            modes=modes)
-
-        # Using ADAM optimizer
-        if optimizer_mode == "adam":
-            # Load default options from config if none specified
-            if options is None:
-                options = {"learning_rate": cfg.NN_LEARNING_RATE,
-                           "lr_decay": cfg.NN_LR_DECAY,
-                           "decay_steps": cfg.NN_LR_DECAY_STEPS,
-                           "decay_rate": cfg.NN_LR_DECAY_RATE}
-
-            # Same for number of iterations
-            if iterations is None:
-                iterations = cfg.NN_ITERATIONS_ADAM
-
-            # Set learning rate
-            if options["lr_decay"]:
-                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
-                                                                    decay_steps=options["decay_steps"],
-                                                                    decay_rate=options["decay_rate"])
-            else:
-                lr = options["learning_rate"]
-
-            # Set optimizer
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-        # Using L-BFGS-B optimizer
-        elif optimizer_mode == "l-bfgs-b":
-            # Load default options from config if none specified
-            if options is None:
-                options = {"maxcor": cfg.NN_MAXCOR,
-                           "gtol": cfg.NN_GTOL}
-
-            # Same for number of iterations
-            if iterations is None:
-                iterations = cfg.NN_ITERATIONS_L_BFGS_B
-
-            # Set optimizer
-            optimizer = kormos.optimizers.ScipyBatchOptimizer()
-
-        # Incorrect mode specified
-        else:
-            print(f"Optimizer mode '{optimizer_mode}' unrecognised, quitting training.")
-            return
-
-        # Define loss function and compile
-        loss = tf.keras.losses.MeanSquaredError()
-        self.model.compile(optimizer=optimizer,
-                           loss=loss)
+        # Compile model
+        self.compile_model(options=options,
+                           optimizer_mode=optimizer_mode)
 
         # Loop over numerous passes so entire dataset is passed through relatively evenly
         # as learning rate decays over time.
@@ -122,7 +150,7 @@ class AcousticNet:
 
                 # Load data from file
                 self.init_data(
-                    util.load_data(f"{self.manager.get_proj_path()}{train_data_dir}/{block_ids[file_num]}.pkl"))
+                    util.load_data(f"{self.manager.get_proj_path()}fdtd/{train_data_dir}/{block_ids[file_num]}.pkl"))
 
                 # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
                 train_X = self.prepare_dataset_for_model(self.train_X)
@@ -178,51 +206,68 @@ class AcousticNet:
 
         # All done
         print(f"Training complete. "
-              f"Took {self.manager.util.timedelta_to_str(training_time)}.\n")
+              f"Took {util.timedelta_to_str(training_time)}.\n")
 
-    # Load model and weights from file
-    def load_model(self,
-                   model_dir):
-        # Load model and weights
-        model_path = f"{self.manager.get_proj_path()}models/{model_dir}/"
-        model_json = util.load_json(f"{model_path}/model.json")
-        self.model = tf.keras.models.model_from_json(model_json,
-                                                     custom_objects={
-                                                         "BatchOptimizedModel": kormos.models.BatchOptimizedModel,
-                                                         "FourierLayer": FourierLayer})
-        self.model.load_weights(model_path)
+    # Compile model with optimizer.  Options are only needed for ADAM optimizer.
+    # This is handled as part of fit_model, shouldn't need to call separately ever.
+    def compile_model(self,
+                      options,
+                      optimizer_mode=cfg.NN_OPTIMIZER):
+        print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
 
-        # Load metadata
-        self.metadata = util.load_json(f"{model_path}/meta.json")
-        print(f"Loaded model, weights and metadata from '{model_path}'.\n")
+        # Using ADAM optimizer
+        if optimizer_mode == "adam":
+            # Set learning rate
+            if options["lr_decay"]:
+                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
+                                                                    decay_steps=options["decay_steps"],
+                                                                    decay_rate=options["decay_rate"])
+            else:
+                lr = options["learning_rate"]
 
-    # Save model and weights to file
-    def save_model(self,
-                   model_name_out):
-        # Make model & parent directory
-        model_path = f"{self.manager.get_proj_path()}models/{model_name_out}/"
-        Path(model_path).mkdir(parents=True, exist_ok=True)
+            # Set optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
 
-        # Save model and weights
-        util.save_json(f"{model_path}/model.json", self.model.to_json())
-        self.model.save_weights(filepath=model_path)
+        # Using L-BFGS-B optimizer
+        elif optimizer_mode == "l-bfgs-b":
+            optimizer = kormos.optimizers.ScipyBatchOptimizer()
+        # Incorrect mode specified
+        # TODO: raise exception
+        else:
+            print(f"Optimizer mode '{optimizer_mode}' unrecognised, quitting training.")
+            return
 
-        # Save metadata
-        util.save_json(f"{model_path}/meta.json", self.metadata)
+        # Define loss function and compile
+        loss = tf.keras.losses.MeanSquaredError()
+        self.model.compile(optimizer=optimizer,
+                           loss=loss)
 
-        print(f"Saved model, weights and metadata to '{model_path}'.\n")
+    # Get default options for model compilation from config
+    @staticmethod
+    def get_default_options(optimizer_mode=cfg.NN_OPTIMIZER):
+        # Using ADAM optimizer
+        if optimizer_mode == "adam":
+            options = {"learning_rate": cfg.ADAM_LEARNING_RATE,
+                       "lr_decay": cfg.ADAM_LR_DECAY,
+                       "decay_steps": cfg.ADAM_LR_DECAY_STEPS,
+                       "decay_rate": cfg.ADAM_LR_DECAY_RATE}
+        # Using L-BFGS-B optimizer
+        elif optimizer_mode == "l-bfgs-b":
+            options = {"maxcor": cfg.BFGS_MAXCOR,
+                       "gtol": cfg.BFGS_GTOL}
+        # Incorrect mode specified
+        # TODO: raise exception
+        else:
+            print(f"Optimizer mode '{optimizer_mode}' unrecognised.")
+            return
+        return options
 
     # Create datasets from data and set metadata parameters
     def init_data(self,
                   data,
                   val_split=cfg.NN_VALIDATION_SPLIT):
-        self.train_X, self.train_y, \
-        self.val_X, self.val_y, \
-        self.metadata["dim_lengths_samples"], \
-        self.metadata["input_shape"], \
-        self.metadata["output_shape"] = \
-            self.create_datasets(data=data,
-                                 val_split=val_split)
+        self.train_X, self.train_y, self.val_X, self.val_y = self.create_datasets(data=data,
+                                                                                  val_split=val_split)
 
     # Create training/validation/testing datasets from an array of simulations
     def create_datasets(self,
@@ -266,19 +311,22 @@ class AcousticNet:
         else:
             val_X, val_y = None, None
 
-        # Return split datasets, dimension length in samples and input/output shapes
+        # Return split datasets
         return train_X, train_y, \
-               val_X, val_y, \
-               (x_len_samples, y_len_samples, steps_to_predict,), \
-               a.shape[2:], u.shape[2:]
+               val_X, val_y
 
     # Saves prediction data
     def save_data(self,
                   data,
                   file_name_out):
-        file_path = f"{self.manager.get_proj_path()}pred/{file_name_out}.pkl"
-        util.save_data(file_path, data)
-        print(f'Saved prediction data as {file_path}".\n')
+        # Make folder
+        file_path = f"{self.manager.get_proj_path()}pred/"
+        Path(file_path).mkdir(parents=True, exist_ok=True)
+
+        # Save data
+        full_path = f"{file_path}{file_name_out}.pkl"
+        util.save_data(full_path, data)
+        print(f'Saved prediction data as {full_path}".\n')
 
     # Wrapper to pass data into model, stacks individual simulations into one big block for batching
     @staticmethod
@@ -288,46 +336,6 @@ class AcousticNet:
         data_reshaped = np.reshape(data, new_shape)
 
         return data_reshaped
-
-    # Create tensorflow model
-    def init_model(self,
-                   num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
-                   width=cfg.NN_HL_WIDTH,
-                   drop_modes=cfg.NN_DROP_MODES,
-                   modes=cfg.NN_MODES):
-        print("Initializing neural network model...")
-
-        # Create layers
-        layers = [tf.keras.Input(self.metadata["input_shape"])]
-
-        # Append up projection layer (linear, no activation)
-        layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
-
-        # Append FNO layers
-        for i in range(num_hidden_layers):
-            last_layer = layers[-1]
-            fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
-                                         in_width=width,
-                                         out_width=width,
-                                         drop_modes=drop_modes,
-                                         modes=modes)(last_layer)
-            conv = tf.keras.layers.Conv2D(filters=width,
-                                          kernel_size=1)(last_layer)
-            layers.append(tf.keras.layers.Add()([fourier_layer, conv]))
-            layers.append(tf.keras.layers.Lambda(lambda x: tf.keras.activations.gelu(x))(layers[-1]))
-
-        # Append down projection layer (linear, no activation)
-        layers.append(tf.keras.layers.Dense(128,
-                                            activation=None)(layers[-1]))
-
-        # Append output layer
-        layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
-                                            activation=None)(layers[-1]))
-
-        # Create model and print summary
-        self.model = kormos.models.BatchOptimizedModel(inputs=layers[0],
-                                                       outputs=layers[-1])
-        self.model.summary()
 
     # Get predictions for a block of simulation data
     # Saves if file_name is not None
@@ -340,8 +348,8 @@ class AcousticNet:
         print(f"Obtaining predictions...")
 
         # Create test X and y datasets
-        test_X, test_y, _, _, _, _, _ = self.create_datasets(data=data,
-                                                             val_split=0)
+        test_X, test_y, _, _, = self.create_datasets(data=data,
+                                                     val_split=0)
 
         # Prepare test_X data
         num_simulations = np.shape(test_X)[0]
@@ -384,8 +392,8 @@ class FourierLayer(tf.keras.layers.Layer):
                  dtype,
                  in_width=cfg.NN_HL_WIDTH,
                  out_width=cfg.NN_HL_WIDTH,
-                 drop_modes=cfg.NN_DROP_MODES,
-                 modes=cfg.NN_MODES,
+                 drop_modes=cfg.FNO_DROP_MODES,
+                 modes=cfg.FNO_MODES,
                  **kwargs):
         super(FourierLayer, self).__init__()
         self.dtype_ = dtype

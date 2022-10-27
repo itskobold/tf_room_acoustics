@@ -15,7 +15,7 @@ class ProjectManager:
     # Set project details
     def __init__(self,
                  proj_name,
-                 seed=cfg.NN_SEED,
+                 seed=cfg.SEED,
                  dim_lengths=cfg.DIM_LENGTHS,
                  c=cfg.C,
                  impulse_a=cfg.IMPULSE_A,

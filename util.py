@@ -1,7 +1,12 @@
 import config as cfg
-from scipy.stats.qmc import LatinHypercube
 import json
 import pickle
+
+# Constants
+SIDE_LEFT = 0
+SIDE_RIGHT = 1
+SIDE_BOTTOM = 2
+SIDE_TOP = 3
 
 
 # Class of utility functions
@@ -32,33 +37,23 @@ class Util:
         y_pos = int((y_len_samples - 1) * xy_pos_relative[1])
         return x_pos, y_pos
 
-    # Sample a set of (x, y) collocation points using LHC sampling
-    def sample_collocation_points(self,
-                                  n=cfg.FDTD_NUM_IC_POSITIONS):
-        # Sample points
-        lhc = LatinHypercube(d=2)
-        samples = lhc.random(n)
 
-        # Map to real space and return
-        x_len = self.manager.metadata["dim_lengths"][0]
-        y_len = self.manager.metadata["dim_lengths"][1]
-        samples[:, 0] = samples[:, 0] * x_len - x_len / 2
-        samples[:, 1] = samples[:, 1] * y_len - y_len / 2
-        return samples
+# Create time string from timedelta object
+def timedelta_to_str(timedelta):
+    hours, rem = divmod(timedelta.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours} hours, {minutes} mins, {seconds} secs"
 
-    # Sample a set of boundary absorption coefficients using LHC sampling
-    @staticmethod
-    def sample_boundary_absorption_coeffs(n=cfg.FDTD_NUM_BC_ABSORPTION_COEFFS):
-        # Sample points and return
-        lhc = LatinHypercube(d=4)
-        return lhc.random(n)
 
-    # Create time string from timedelta object
-    @staticmethod
-    def timedelta_to_str(timedelta):
-        hours, rem = divmod(timedelta.seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        return f"{hours} hours, {minutes} mins, {seconds} secs"
+# Get neural network input shape from data shape (X, Y, T)
+def input_shape_from_data_shape(data_shape,
+                                t_lookback=cfg.FNO_T_LOOKBACK):
+    return data_shape[:2] + [t_lookback + 2]  # +2 for the additional (x, y) coordinate encoded into layer depth
+
+
+# Get neural network output shape from data shape (X, Y, T)
+def output_shape_from_data_shape(data_shape):
+    return data_shape[:2] + [1]
 
 
 # Load .json from file

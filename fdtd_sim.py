@@ -1,9 +1,10 @@
 import config as cfg
 import util
+from util import *
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from sklearn.utils import shuffle
+from scipy.stats.qmc import LatinHypercube
 
 
 # Class for managing FDTD simulation
@@ -19,19 +20,14 @@ class FDTD:
 
     # Run acoustic finite-difference time domain simulation
     def run(self,
-            ic_positions,
-            bc_abs_coeffs,
+            num_solutions,
             file_name_out,
-            sims_per_file=cfg.FDTD_SOLUTIONS_PER_FILE):
-        print(f"Starting FDTD simulation '{file_name_out}...'")
+            sims_per_file=cfg.FDTD_SOLUTIONS_PER_FILE,
+            round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+        print(f"Starting FDTD simulation '{file_name_out}'...")
 
         # Init metadata dict
         metadata = {}
-
-        # Generate solutions for each IC and BC passed
-        num_ic_positions = np.shape(ic_positions)[0]
-        num_bc_coeffs = np.shape(bc_abs_coeffs)[0]
-        num_total_solutions = num_ic_positions * num_bc_coeffs
 
         # Get grid spacing and system sample rate
         grid_spacing = self.manager.metadata["c"] / self.f_max / self.ppw
@@ -62,30 +58,20 @@ class FDTD:
                              y_len_samples,
                              t_len_samples])
 
-        # Combine IC and BC points, shuffle together
-        ic_pos_repeated = np.repeat(ic_positions,
-                                    repeats=np.shape(bc_abs_coeffs)[0],
-                                    axis=0)
-        bc_abs_tiled = np.tile(bc_abs_coeffs,
-                               reps=(np.shape(ic_positions)[0], 1))
-        ic_bc = np.concatenate([ic_pos_repeated, bc_abs_tiled],
-                               axis=1)
-        ic_bc_shuf = shuffle(ic_bc,
-                             random_state=self.manager.metadata["seed"])
-
         # Start timer for entire computation
         t0_all = datetime.now()
 
         # Loop for number of solutions to be generated
         data = init_array()
         solution_index = 0
+        total_solution_index = 0
         file_num = 0
-        for i in range(num_total_solutions):
+        for i in range(num_solutions):
             # Get IC/BC points
-            ic_pos = ic_bc_shuf[i, :2]
-            bc_abs = ic_bc_shuf[i, 2:]
+            ic_pos = self.sample_collocation_point()
+            bc_abs = self.sample_boundary_absorption_coeff(round_bc_coeffs)
 
-            print(f"Running FDTD simulation {i + 1}/{num_total_solutions}: "
+            print(f"Running FDTD simulation {i + 1}/{num_solutions}: "
                   f"IC {ic_pos}, BC = {bc_abs}", end='')
 
             # Apply initial condition to pressure matrix at time step 0
@@ -97,7 +83,7 @@ class FDTD:
                     y_val -= y_len / 2
                     data[solution_index][x_, y_, 0] = self.manager.icbc.gaussian_ic(x_val, y_val,
                                                                                     impulse_xy=ic_pos)
-#
+
             # Start timer for this simulation
             t0 = datetime.now()
             for step in range(1, t_len_samples - 1):
@@ -127,28 +113,28 @@ class FDTD:
                             next_p[x, y] = 0
                         # Left boundary
                         elif x == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("left",
+                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_LEFT,
                                                                           boundary_abs=bc_abs,
                                                                           current_p=current_p,
                                                                           prev_p=prev_p,
                                                                           x=x, y=y)
                         # Right boundary
                         elif x == x_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("right",
+                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_RIGHT,
                                                                           boundary_abs=bc_abs,
                                                                           current_p=current_p,
                                                                           prev_p=prev_p,
                                                                           x=x, y=y)
                         # Bottom boundary
                         elif y == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("bottom",
+                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_BOTTOM,
                                                                           boundary_abs=bc_abs,
                                                                           current_p=current_p,
                                                                           prev_p=prev_p,
                                                                           x=x, y=y)
                         # Top boundary
                         elif y == y_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc("top",
+                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_TOP,
                                                                           boundary_abs=bc_abs,
                                                                           current_p=current_p,
                                                                           prev_p=prev_p,
@@ -168,7 +154,7 @@ class FDTD:
 
             # Increment solution index and handle saving
             solution_index += 1
-            if solution_index >= sims_per_file or i >= num_total_solutions - 1:
+            if solution_index >= sims_per_file or i >= num_solutions - 1:
                 # Save FDTD data to file
                 self.save_data(data,
                                file_name_out=file_name_out,
@@ -180,21 +166,22 @@ class FDTD:
                 data = init_array()
 
             # Update simulation metadata
-            metadata[solution_index] = {"impulse_xy": ic_pos.tolist(),
-                                        "boundary_abs": bc_abs.tolist()}
+            metadata[total_solution_index] = {"impulse_xy": ic_pos.tolist(),
+                                              "boundary_abs": bc_abs.tolist()}
+            total_solution_index += 1
 
         # Stop timer for entire computation
         timedelta = datetime.now() - t0_all
         metadata["computation_time"] = timedelta.total_seconds() * 1000  # In MS
         metadata["num_files"] = file_num
         print(f"Total FDTD simulation time: "
-              f"{self.manager.util.timedelta_to_str(timedelta)}.\n")
+              f"{util.timedelta_to_str(timedelta)}.\n")
 
         # Save metadata
         self.save_metadata(metadata,
                            file_name_out=file_name_out)
 
-    # Saves FDTD data to file
+    # Saves FDTD data to file.
     def save_data(self,
                   data,
                   file_name_out,
@@ -208,7 +195,7 @@ class FDTD:
         util.save_data(full_path, data)
         print(f"Block {file_num}: saved FDTD data to '{full_path}'.")
 
-    # Save metadata as .json after all simulations are complete
+    # Save metadata as .json after all simulations are complete.
     def save_metadata(self,
                       metadata,
                       file_name_out):
@@ -220,3 +207,40 @@ class FDTD:
         full_path = f"{file_path}meta.json"
         util.save_json(f"{file_path}meta.json", metadata)
         print(f"Saved FDTD metadata as '{full_path}'.\n")
+
+    # Sample a set of (x, y) collocation points using LHC sampling.
+    def sample_collocation_points(self, n):
+        # Sample points
+        lhc = LatinHypercube(d=2)
+        samples = lhc.random(n)
+
+        # Map to real space and return
+        x_len = self.manager.metadata["dim_lengths"][0]
+        y_len = self.manager.metadata["dim_lengths"][1]
+        samples[:, 0] = samples[:, 0] * x_len - x_len / 2
+        samples[:, 1] = samples[:, 1] * y_len - y_len / 2
+        return samples
+
+    # Sample just 1 (x, y) collocation point and return it.
+    def sample_collocation_point(self):
+        return self.sample_collocation_points(1)[0]
+
+    # Sample a set of boundary absorption coefficients using LHC sampling.
+    @staticmethod
+    def sample_boundary_absorption_coeffs(n,
+                                          round_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+        # Sample points
+        lhc = LatinHypercube(d=4)
+        bc_coeffs = lhc.random(n)
+
+        # Round sampled points
+        if round_coeffs:
+            bc_coeffs = np.around(bc_coeffs,
+                                  decimals=2)
+        return bc_coeffs
+
+    # Sample just 1 set of boundary absorption coefficients.
+    # Round to 2 decimal places if round is True.
+    def sample_boundary_absorption_coeff(self,
+                                         round_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+        return self.sample_boundary_absorption_coeffs(1, round_coeffs)[0]
