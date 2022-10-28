@@ -1,9 +1,7 @@
 import util
 from fdtd_sim import FDTD
 from render import Renderer
-from util import Util
 from nn import AcousticNet
-from icbc import ICBC
 import config as cfg
 from pathlib import Path
 import tensorflow as tf
@@ -18,8 +16,6 @@ class ProjectManager:
                  seed=cfg.SEED,
                  dim_lengths=cfg.DIM_LENGTHS,
                  c=cfg.C,
-                 impulse_a=cfg.IMPULSE_A,
-                 impulse_r=cfg.IMPULSE_R,
                  dtype=cfg.DTYPE):
         # Set project name and init seed
         self.proj_name = proj_name
@@ -42,8 +38,6 @@ class ProjectManager:
             self.metadata = {"seed": seed,
                              "dim_lengths": dim_lengths,
                              "c": c,
-                             "impulse_a": impulse_a,
-                             "impulse_r": impulse_r,
                              "dtype": dtype}
 
             # Save metadata
@@ -59,8 +53,7 @@ class ProjectManager:
         self.renderer = Renderer(self)
         self.fdtd = FDTD(self)
         self.nn = AcousticNet(self)
-        self.icbc = ICBC(self)
-        self.util = Util(self)
+        self.util = util.Util(self)
 
     # Return path to this project folder
     def get_proj_path(self):

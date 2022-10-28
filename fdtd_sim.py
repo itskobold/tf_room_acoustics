@@ -1,6 +1,6 @@
 import config as cfg
 import util
-from util import *
+import icbc
 import numpy as np
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +20,8 @@ class FDTD:
 
     # Run acoustic finite-difference time domain simulation
     def run(self,
-            num_solutions,
             file_name_out,
+            num_solutions=cfg.FDTD_NUM_SOLUTIONS,
             sims_per_file=cfg.FDTD_SOLUTIONS_PER_FILE,
             round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
         print(f"Starting FDTD simulation '{file_name_out}'...")
@@ -30,8 +30,9 @@ class FDTD:
         metadata = {}
 
         # Get grid spacing and system sample rate
+        lmb = np.sqrt(0.5)
         grid_spacing = self.manager.metadata["c"] / self.f_max / self.ppw
-        dt = np.sqrt(0.5) * grid_spacing / self.manager.metadata["c"]
+        dt = lmb * grid_spacing / self.manager.metadata["c"]
 
         # Readability
         x_len = self.manager.metadata["dim_lengths"][0]
@@ -46,7 +47,6 @@ class FDTD:
         metadata["dim_lengths_samples"] = x_len_samples, y_len_samples, t_len_samples
 
         # Init constants for finite difference calculation
-        lmb = np.sqrt(0.5)
         a = 2 - (4 * lmb ** 2)
         b = lmb ** 2
         c = -1
@@ -69,6 +69,9 @@ class FDTD:
         for i in range(num_solutions):
             # Get IC/BC points
             ic_pos = self.sample_collocation_point()
+            # ic_x = np.random.randint(1, x_len_samples)
+            # ic_y = np.random.randint(1, y_len_samples)
+            # ic_pos = np.array([ic_x, ic_y])
             bc_abs = self.sample_boundary_absorption_coeff(round_bc_coeffs)
 
             print(f"Running FDTD simulation {i + 1}/{num_solutions}: "
@@ -81,8 +84,20 @@ class FDTD:
                     y_val = y_ / y_len_samples * y_len
                     x_val -= x_len / 2
                     y_val -= y_len / 2
-                    data[solution_index][x_, y_, 0] = self.manager.icbc.gaussian_ic(x_val, y_val,
-                                                                                    impulse_xy=ic_pos)
+                    p_ic = icbc.gaussian_ic(x_val, y_val,
+                                            impulse_xy=ic_pos,
+                                            impulse_v=grid_spacing ** 2)
+
+                    # Set pressure
+                    data[solution_index][x_, y_, 0] = p_ic
+
+            # Rescale between [0, 1]
+            p_min = np.amin(data[solution_index][:, :, 0])
+            p_max = np.amax(data[solution_index][:, :, 0])
+            data[solution_index][:, :, 0] = (data[solution_index][:, :, 0] - p_min) / (p_max - p_min)
+
+            # Dirac
+            # data[solution_index][ic_x, ic_y, 0] = 1
 
             # Start timer for this simulation
             t0 = datetime.now()
@@ -113,32 +128,32 @@ class FDTD:
                             next_p[x, y] = 0
                         # Left boundary
                         elif x == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_LEFT,
-                                                                          boundary_abs=bc_abs,
-                                                                          current_p=current_p,
-                                                                          prev_p=prev_p,
-                                                                          x=x, y=y)
+                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_LEFT,
+                                                             boundary_abs=bc_abs,
+                                                             current_p=current_p,
+                                                             prev_p=prev_p,
+                                                             x=x, y=y)
                         # Right boundary
                         elif x == x_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_RIGHT,
-                                                                          boundary_abs=bc_abs,
-                                                                          current_p=current_p,
-                                                                          prev_p=prev_p,
-                                                                          x=x, y=y)
+                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_RIGHT,
+                                                             boundary_abs=bc_abs,
+                                                             current_p=current_p,
+                                                             prev_p=prev_p,
+                                                             x=x, y=y)
                         # Bottom boundary
                         elif y == 0:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_BOTTOM,
-                                                                          boundary_abs=bc_abs,
-                                                                          current_p=current_p,
-                                                                          prev_p=prev_p,
-                                                                          x=x, y=y)
+                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_BOTTOM,
+                                                             boundary_abs=bc_abs,
+                                                             current_p=current_p,
+                                                             prev_p=prev_p,
+                                                             x=x, y=y)
                         # Top boundary
                         elif y == y_len_samples - 1:
-                            next_p[x, y] = self.manager.icbc.absorbing_bc(SIDE_TOP,
-                                                                          boundary_abs=bc_abs,
-                                                                          current_p=current_p,
-                                                                          prev_p=prev_p,
-                                                                          x=x, y=y)
+                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_TOP,
+                                                             boundary_abs=bc_abs,
+                                                             current_p=current_p,
+                                                             prev_p=prev_p,
+                                                             x=x, y=y)
                         # Within domain
                         if x != 0 and x != x_len_samples - 1 and y != 0 and y != y_len_samples - 1:
                             next_p[x, y] = a * current_p[x, y] + \
