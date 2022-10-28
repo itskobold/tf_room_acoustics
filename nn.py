@@ -406,38 +406,43 @@ class FourierLayer(tf.keras.layers.Layer):
         self.b = None
 
     def build(self, input_shape):
-        # Get shape of weight matrix in real space
-        weight_shape = input_shape[1:]
+        # Get shape of weight matrix
+        # Transform a dummy tensor of zeros to get the weight shape
+        x_tmp = tf.zeros(input_shape[1:])
+        x_ft = tf.signal.rfft2d(x_tmp)
+        weight_shape = tf.shape(x_ft)
 
-        # Initialize weights
-        w_init = self.scale * tf.random.uniform(shape=weight_shape,
-                                                dtype=self.dtype_)
+        # Initialize weights as complex numbers
+        w_init = tf.complex(self.scale * tf.random.uniform(shape=weight_shape,
+                                                           dtype=self.dtype_),
+                            self.scale * tf.random.uniform(shape=weight_shape,
+                                                           dtype=self.dtype_))
         self.w = tf.Variable(name="kernel",
                              initial_value=w_init,
                              trainable=True,
-                             dtype=self.dtype_)
+                             dtype="complex128")
 
-        # Initialize biases
-        b_init = tf.zeros_initializer()(shape=weight_shape,
-                                        dtype=self.dtype_)
+        # Initialize biases in the same manner
+        b_init = tf.complex(tf.zeros(shape=weight_shape,
+                                     dtype=self.dtype_),
+                            tf.zeros(shape=weight_shape,
+                                     dtype=self.dtype_))
         self.b = tf.Variable(name="bias",
                              initial_value=b_init,
                              trainable=True,
-                             dtype=self.dtype_)
+                             dtype="complex128")
 
     def call(self, inputs):
-        # Fourier transform on inputs, weights and bias weights
+        # Fourier transform on inputs (weights and bias weights are already complex numbers)
         x_ft = tf.signal.rfft2d(inputs)
-        w_ft = tf.signal.rfft2d(self.w)
-        b_ft = tf.signal.rfft2d(self.b)
 
         # Multiply Fourier modes with transformed weight matrix and add bias
-        xw_ft = tf.add(tf.multiply(x_ft, w_ft), b_ft)
+        xw_ft = tf.add(tf.multiply(x_ft, self.w), self.b)
 
         # Drop Fourier modes as a regularization measure
         # TODO: fix? investigate
         if self.drop_modes:
-            xw_ft_m = tf.zeros([self.modes * 2, self.modes * 2, w_ft.shape[-1]])
+            #xw_ft_m = tf.zeros([self.modes * 2, self.modes * 2, self.w.shape[-1]])
             m_tl = xw_ft[:self.modes, :self.modes]
             m_tr = xw_ft[-self.modes:, :self.modes]
             m_bl = xw_ft[:self.modes, -self.modes:]
