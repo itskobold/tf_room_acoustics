@@ -64,7 +64,6 @@ class AcousticNet:
                    num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
                    width=cfg.NN_HL_WIDTH,
                    t_lookback=cfg.FNO_T_LOOKBACK,
-                   drop_modes=cfg.FNO_DROP_MODES,
                    modes=cfg.FNO_MODES):
         print("Initializing neural network model...")
 
@@ -92,7 +91,6 @@ class AcousticNet:
             fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
                                          in_width=width,
                                          out_width=width,
-                                         drop_modes=drop_modes,
                                          modes=modes)(last_layer)
             conv = tf.keras.layers.Conv2D(filters=width,
                                           kernel_size=1)(last_layer)
@@ -392,82 +390,104 @@ class FourierLayer(tf.keras.layers.Layer):
                  dtype,
                  in_width=cfg.NN_HL_WIDTH,
                  out_width=cfg.NN_HL_WIDTH,
-                 drop_modes=cfg.FNO_DROP_MODES,
                  modes=cfg.FNO_MODES,
                  **kwargs):
         super(FourierLayer, self).__init__()
         self.dtype_ = dtype
         self.in_width = in_width
         self.out_width = out_width
-        self.drop_modes = drop_modes
         self.modes = modes
         self.scale = 1 / (self.in_width * self.out_width)
-        self.w = None
-        self.b = None
 
     def build(self, input_shape):
+        # Init weights as randomly sampled complex numbers
+        def init_weights(shape):
+            w_init = tf.complex(self.scale * tf.random.uniform(shape=shape,
+                                                               dtype=self.dtype_),
+                                self.scale * tf.random.uniform(shape=shape,
+                                                               dtype=self.dtype_))
+            return tf.Variable(name="kernel",
+                               initial_value=w_init,
+                               trainable=True,
+                               dtype="complex128")
+
+        # Init biases as complex zeros
+        def init_bias(shape):
+            b_init = tf.complex(tf.zeros(shape=shape,
+                                         dtype=self.dtype_),
+                                tf.zeros(shape=shape,
+                                         dtype=self.dtype_))
+            return tf.Variable(name="bias",
+                               initial_value=b_init,
+                               trainable=True,
+                               dtype="complex128")
+
         # Get shape of weight matrix
         # Transform a dummy tensor of zeros to get the weight shape
-        x_tmp = tf.zeros(input_shape[1:])
-        x_ft = tf.signal.rfft2d(x_tmp)
-        weight_shape = tf.shape(x_ft)
+        x = tf.zeros(input_shape[1:])
+        x_t = tf.transpose(x, perm=[2, 0, 1])
+        x_ft = tf.signal.rfft2d(x_t, fft_length=[input_shape[1],
+                                                 input_shape[2]])
 
-        # Initialize weights as complex numbers
-        w_init = tf.complex(self.scale * tf.random.uniform(shape=weight_shape,
-                                                           dtype=self.dtype_),
-                            self.scale * tf.random.uniform(shape=weight_shape,
-                                                           dtype=self.dtype_))
-        self.w = tf.Variable(name="kernel",
-                             initial_value=w_init,
-                             trainable=True,
-                             dtype="complex128")
+        # Initialize weights and biases
+        if self.modes > 0:
+            t_shape = input_shape[-1]
+            wb_shape = [t_shape,  # t_shape first because (X, Y, T) inputs are permuted to (T, X, Y)
+                        self.modes,
+                        self.modes]
 
-        # Initialize biases in the same manner
-        b_init = tf.complex(tf.zeros(shape=weight_shape,
-                                     dtype=self.dtype_),
-                            tf.zeros(shape=weight_shape,
-                                     dtype=self.dtype_))
-        self.b = tf.Variable(name="bias",
-                             initial_value=b_init,
-                             trainable=True,
-                             dtype="complex128")
+            self.w_tl = init_weights(wb_shape)
+            self.w_tr = init_weights(wb_shape)
+            self.w_bl = init_weights(wb_shape)
+            self.w_br = init_weights(wb_shape)
+            self.b_tl = init_bias(wb_shape)
+            self.b_tr = init_bias(wb_shape)
+            self.b_bl = init_bias(wb_shape)
+            self.b_br = init_bias(wb_shape)
+        else:
+            wb_shape = tf.shape(x_ft)
 
+            self.w = init_weights(wb_shape)
+            self.b = init_bias(wb_shape)
+
+    # Dimensions:
+    # 0: batch
+    # 1: x value
+    # 2: y value
+    # 3: t value
     def call(self, inputs):
         # Fourier transform on inputs (weights and bias weights are already complex numbers)
-        x_ft = tf.signal.rfft2d(inputs)
-
-        # Multiply Fourier modes with transformed weight matrix and add bias
-        xw_ft = tf.add(tf.multiply(x_ft, self.w), self.b)
+        # FFT is computed on 2 outermost axes - we want these to be the spatial X/Y axes
+        input_shape = tf.shape(inputs)
+        x_t = tf.transpose(inputs, perm=[0, 3, 1, 2])
+        x_ft = tf.signal.rfft2d(x_t, fft_length=[input_shape[1],
+                                                 input_shape[2]])
 
         # Drop Fourier modes as a regularization measure
-        # TODO: fix? investigate
-        if self.drop_modes:
-            #xw_ft_m = tf.zeros([self.modes * 2, self.modes * 2, self.w.shape[-1]])
-            m_tl = xw_ft[:self.modes, :self.modes]
-            m_tr = xw_ft[-self.modes:, :self.modes]
-            m_bl = xw_ft[:self.modes, -self.modes:]
-            m_br = xw_ft[-self.modes:, -self.modes:]
-            m_t = tf.concat([m_tl, m_tr], axis=1)
-            m_b = tf.concat([m_bl, m_br], axis=1)
-            xw_ft = tf.concat([m_t, m_b], axis=0)
+        if self.modes > 0:
+            m_tl = x_ft[:, :, :self.modes, :self.modes]
+            m_tr = x_ft[:, :, -self.modes:, :self.modes]
+            m_bl = x_ft[:, :, :self.modes, -self.modes:]
+            m_br = x_ft[:, :, -self.modes:, -self.modes:]
 
-            # xw_ft_m[:self.modes, :self.modes] = xw_ft[:self.modes, :self.modes]
-            # xw_ft_m[-self.modes:, :self.modes] = xw_ft[-self.modes:, :self.modes]
-            # xw_ft_m[:self.modes, -self.modes:] = xw_ft[:self.modes, -self.modes:]
-            # xw_ft_m[-self.modes:, -self.modes:] = xw_ft[-self.modes:, -self.modes:]
-            # xw_ft = xw_ft_m
+            # Multiply Fourier modes with weight matrices and add biases
+            xwb_tl = tf.add(tf.multiply(m_tl, self.w_tl), self.b_tl)
+            xwb_tr = tf.add(tf.multiply(m_tr, self.w_tr), self.b_tr)
+            xwb_bl = tf.add(tf.multiply(m_bl, self.w_bl), self.b_bl)
+            xwb_br = tf.add(tf.multiply(m_br, self.w_br), self.b_br)
 
-            # mask = np.zeros(w_ft.shape)
-            # ones = np.ones([self.modes, self.modes, w_ft.shape[-1]])
-            # mask[:self.modes, :self.modes, :] = ones
-            # mask[-self.modes:, :self.modes, :] = ones
-            # mask[:self.modes, -self.modes:, :] = ones
-            # mask[-self.modes:, -self.modes:, :] = ones
-            # mask_tf = tf.convert_to_tensor(mask, dtype="complex128")
-            # xw_ft = tf.multiply(xw_ft, mask_tf)
+            # Recombine into one signal
+            xwb_t = tf.concat([xwb_tl, xwb_tr], axis=-1)
+            xwb_b = tf.concat([xwb_bl, xwb_br], axis=-1)
+            xwb = tf.concat([xwb_t, xwb_b], axis=-2)
+        # Otherwise handle the signal normally
+        else:
+            xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
 
-        # Inverse FFT and return
-        return tf.signal.irfft2d(xw_ft)
+        # Inverse FFT, transpose back into right shape and return
+        x_r = tf.signal.irfft2d(xwb, fft_length=[input_shape[1],
+                                                 input_shape[2]])
+        return tf.transpose(x_r, perm=[0, 2, 3, 1])
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
@@ -475,7 +495,6 @@ class FourierLayer(tf.keras.layers.Layer):
         config.update({
             'in_width': self.in_width,
             'out_width': self.out_width,
-            'drop_modes': self.drop_modes,
             'modes': self.modes
         })
         return config

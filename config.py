@@ -23,7 +23,7 @@ FDTD_ROUND_BC_COEFFS = True  # Round BC absorption coefficients to 2 decimal pla
 NN_HIDDEN_LAYERS = 4
 NN_HL_WIDTH = 20
 NN_OPTIMIZER = "adam"
-NN_ITERATIONS = 20
+NN_ITERATIONS = 5
 NN_BATCH_SIZE = 64
 NN_BIG_BATCH_SIZE = 128
 NN_NUM_PASSES = 1
@@ -31,8 +31,7 @@ NN_VALIDATION_SPLIT = 0.001
 
 # Fourier layer options
 FNO_T_LOOKBACK = 32
-FNO_DROP_MODES = False
-FNO_MODES = 8
+FNO_MODES = 8  # Number of modes to keep from FFT.  Set to -1 to drop no modes
 
 # ADAM optimizer options
 ADAM_LEARNING_RATE = 0.001
