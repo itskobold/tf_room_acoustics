@@ -115,6 +115,15 @@ def calc_error_heatmap(true_data,
     return error_grid
 
 
+def array_to_formatted_str(data):
+    ret = ""
+    for i, entry in enumerate(data):
+        ret += str(entry)
+        if i + 1 < len(data):
+            ret += ", "
+    return ret
+
+
 # Load .json from file.
 def load_json(file_path):
     with open(file_path, "r") as inp:

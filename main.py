@@ -4,6 +4,7 @@ import numpy as np
 
 RENDER_ERROR = True
 RENDER_ANIMS = True
+RENDER_FDTD_ANIMS = False
 RENDER_IRS = True
 RUN_FDTD = False
 RUN_FDTD_TEST = False
@@ -77,39 +78,40 @@ for i in range(num_files):
             errors_mre.append(util.calc_error_heatmap(true_data=test_data[test_index],
                                                       pred_data=pred_data[test_index],
                                                       error_mode="mre"))
-            titles_mre.append("FDTD vs. prediction MRE:\n"
-                              f"IC (x, y) {ic_pos}\n"
-                              f"BC (l, r, b, t) {bc_abs}")
+            titles_mre.append("MRE$(Data_{true}, Data_{prediction})$\n"
+                              f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$\n"
+                              f"BC $(l, r, b, t)$: ${util.array_to_formatted_str(bc_abs)}$")
             file_names_out_mre.append(f"{SIM_NAME}_mre_"
                                       f"{total_index}")
 
             errors_rmse.append(util.calc_error_heatmap(true_data=test_data[test_index],
                                                        pred_data=pred_data[test_index],
                                                        error_mode="rmse"))
-            titles_rmse.append("FDTD vs. prediction RMSE:\n"
-                               f"IC (x, y) {ic_pos}\n"
-                               f"BC (l, r, b, t) {bc_abs}")
+            titles_rmse.append("RMSE$(Data_{true}, Data_{prediction})$\n"
+                               f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$\n"
+                               f"BC $(l, r, b, t)$: ${util.array_to_formatted_str(bc_abs)}$")
             file_names_out_rmse.append(f"{SIM_NAME}_rmse_"
                                        f"{total_index}")
 
-        if RENDER_ANIMS:
-            manager.renderer.animate_sound_field(data=test_data[test_index],
-                                                 file_name_out=f"{SIM_NAME}_fdtd_{total_index}",
-                                                 title=f"FDTD:\n"
-                                                       f"IC (x, y) {ic_pos}\n"
-                                                       f"BC (l, r, b, t) {bc_abs}")
-            manager.renderer.animate_sound_field(data=pred_data[test_index],
-                                                 file_name_out=f"{SIM_NAME}_pred_{total_index}",
-                                                 title=f"Prediction:\n"
-                                                       f"IC (x, y) {ic_pos}\n"
-                                                       f"BC (l, r, b, t) {bc_abs}")
-            manager.renderer.animate_sound_field_difference(true_data=test_data[test_index],
-                                                            pred_data=pred_data[test_index],
-                                                            file_name_out=f"{SIM_NAME}_test_error_"
-                                                                          f"{total_index}",
-                                                            title=f"Relative error:\n"
-                                                                  f"IC (x, y) {ic_pos}\n"
-                                                                  f"BC (l, r, b, t) {bc_abs}")
+            if RENDER_FDTD_ANIMS:
+                manager.renderer.animate_sound_field(data=test_data[test_index],
+                                                     file_name_out=f"{SIM_NAME}_fdtd_{total_index}",
+                                                     title="Data$_{true}$\n"
+                                                           f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$\n"
+                                                           f"BC $(l, r, b, t)$: ${util.array_to_formatted_str(bc_abs)}$")
+            if RENDER_ANIMS:
+                manager.renderer.animate_sound_field(data=pred_data[test_index],
+                                                     file_name_out=f"{SIM_NAME}_pred_{total_index}",
+                                                     title="Data$_{prediction}$\n"
+                                                           f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$\n"
+                                                           f"BC $(l, r, b, t)$: ${util.array_to_formatted_str(bc_abs)}$")
+                manager.renderer.animate_sound_field_difference(true_data=test_data[test_index],
+                                                                pred_data=pred_data[test_index],
+                                                                file_name_out=f"{SIM_NAME}_test_error_"
+                                                                              f"{total_index}",
+                                                                title="Data$_{true}$ - Data$_{prediction}$\n"
+                                                                      f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$\n"
+                                                                      f"BC $(l, r, b, t)$: ${util.array_to_formatted_str(bc_abs)}$")
 
     # Render impulse responses
     if RENDER_IRS:

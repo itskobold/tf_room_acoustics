@@ -140,7 +140,8 @@ class Renderer:
                               ax_labels=["X (meters)", "Y (meters)", "Pressure"],
                               title=title,
                               colormap=colormap,
-                              fps=fps)
+                              fps=fps,
+                              scale_cb=False)
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -167,7 +168,8 @@ class Renderer:
                               ax_labels=["X (meters)", "Y (meters)", "Diff."],
                               title=title,
                               colormap=colormap,
-                              fps=fps)
+                              fps=fps,
+                              scale_cb=True)
 
         # Save animation
         self.save_animation(file_name_out, anim, fps)
@@ -179,7 +181,8 @@ class Renderer:
                   title=None,
                   colormap=cfg.ANIM_COLORMAP,
                   fps=cfg.ANIM_FPS,
-                  max_frames=cfg.ANIM_MAX_FRAMES):
+                  max_frames=cfg.ANIM_MAX_FRAMES,
+                  scale_cb=False):
 
         # Create figure
         fig = plt.figure(figsize=(8, 8))
@@ -192,7 +195,7 @@ class Renderer:
         # Create image object
         x_len = self.manager.metadata["dim_lengths"][0] / 2
         y_len = self.manager.metadata["dim_lengths"][1] / 2
-        im = plt.imshow(data[0], interpolation="bilinear", cmap=colormap,
+        im = plt.imshow(data[0], interpolation="spline36", cmap=colormap,
                         origin="lower", extent=[-x_len, x_len, -y_len, y_len])
 
         # Set colorbar
@@ -210,14 +213,17 @@ class Renderer:
 
             # Get data slice
             data_slice = data[:, :, t]
-            vmin = np.amin(data_slice)
-            vmax = np.amax(data_slice)
-            lim = max([vmin, vmax])
 
             # Set image array data - need to swap axes here for some reason
             im.set_array(np.swapaxes(data_slice, 0, 1))
 
             # Rescale colorbar
+            if scale_cb:
+                vmin = np.amin(data_slice)
+                vmax = np.amax(data_slice)
+            else:
+                vmin, vmax = -1, 1
+            lim = max([vmin, vmax])
             im.set_clim(vmax=lim, vmin=-lim)
             return [im]
 

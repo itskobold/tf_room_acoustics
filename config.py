@@ -26,17 +26,17 @@ NN_OPTIMIZER = "adam"
 NN_ITERATIONS = 5
 NN_BATCH_SIZE = 64
 NN_BIG_BATCH_SIZE = 128
-NN_NUM_PASSES = 1
+NN_NUM_PASSES = 3
 NN_VALIDATION_SPLIT = 0.001
 
 # Fourier layer options
 FNO_T_LOOKBACK = 32
-FNO_MODES = 8  # Number of modes to keep from FFT.  Set to -1 to drop no modes
+FNO_MODES = -1  # Number of modes to keep from FFT.  Set to -1 to drop no modes
 
 # ADAM optimizer options
 ADAM_LEARNING_RATE = 0.001
 ADAM_LR_DECAY = True
-ADAM_LR_DECAY_STEPS = 100
+ADAM_LR_DECAY_STEPS = 1000
 ADAM_LR_DECAY_RATE = 0.5
 
 # L-BFGS-B optimizer options

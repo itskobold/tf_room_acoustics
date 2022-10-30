@@ -402,37 +402,25 @@ class FourierLayer(tf.keras.layers.Layer):
     def build(self, input_shape):
         # Init weights as randomly sampled complex numbers
         def init_weights(shape):
-            w_init = tf.complex(self.scale * tf.random.uniform(shape=shape,
-                                                               dtype=self.dtype_),
-                                self.scale * tf.random.uniform(shape=shape,
-                                                               dtype=self.dtype_))
+            w_init = self.scale * tf.random.uniform(shape=shape,
+                                                    dtype=self.dtype_)
             return tf.Variable(name="kernel",
                                initial_value=w_init,
                                trainable=True,
-                               dtype="complex128")
+                               dtype="float64")
 
         # Init biases as complex zeros
         def init_bias(shape):
-            b_init = tf.complex(tf.zeros(shape=shape,
-                                         dtype=self.dtype_),
-                                tf.zeros(shape=shape,
-                                         dtype=self.dtype_))
+            b_init = tf.zeros(shape=shape,
+                              dtype=self.dtype_)
             return tf.Variable(name="bias",
                                initial_value=b_init,
                                trainable=True,
-                               dtype="complex128")
-
-        # Get shape of weight matrix
-        # Transform a dummy tensor of zeros to get the weight shape
-        x = tf.zeros(input_shape[1:])
-        x_t = tf.transpose(x, perm=[2, 0, 1])
-        x_ft = tf.signal.rfft2d(x_t, fft_length=[input_shape[1],
-                                                 input_shape[2]])
+                               dtype="float64")
 
         # Initialize weights and biases
         if self.modes > 0:
-            t_shape = input_shape[-1]
-            wb_shape = [t_shape,  # t_shape first because (X, Y, T) inputs are permuted to (T, X, Y)
+            wb_shape = [self.modes,
                         self.modes,
                         self.modes]
 
@@ -445,6 +433,10 @@ class FourierLayer(tf.keras.layers.Layer):
             self.b_bl = init_bias(wb_shape)
             self.b_br = init_bias(wb_shape)
         else:
+            # Transform a dummy tensor of zeros to get the weight shape
+            x = tf.complex(tf.zeros(input_shape[1:]),
+                           tf.zeros(input_shape[1:]))
+            x_ft = tf.signal.fft3d(x)
             wb_shape = tf.shape(x_ft)
 
             self.w = init_weights(wb_shape)
@@ -457,18 +449,17 @@ class FourierLayer(tf.keras.layers.Layer):
     # 3: t value
     def call(self, inputs):
         # Fourier transform on inputs (weights and bias weights are already complex numbers)
-        # FFT is computed on 2 outermost axes - we want these to be the spatial X/Y axes
-        input_shape = tf.shape(inputs)
-        x_t = tf.transpose(inputs, perm=[0, 3, 1, 2])
-        x_ft = tf.signal.rfft2d(x_t, fft_length=[input_shape[1],
-                                                 input_shape[2]])
+        # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
+        # Use fft3d instead for now and just ignore the imaginary part
+        x = tf.complex(inputs, inputs)
+        x_ft = tf.math.real(tf.signal.fft3d(x))
 
         # Drop Fourier modes as a regularization measure
         if self.modes > 0:
-            m_tl = x_ft[:, :, :self.modes, :self.modes]
-            m_tr = x_ft[:, :, -self.modes:, :self.modes]
-            m_bl = x_ft[:, :, :self.modes, -self.modes:]
-            m_br = x_ft[:, :, -self.modes:, -self.modes:]
+            m_tl = x_ft[:, :self.modes, :self.modes, :self.modes]
+            m_tr = x_ft[:, -self.modes:, :self.modes, :self.modes]
+            m_bl = x_ft[:, :self.modes, -self.modes:, :self.modes]
+            m_br = x_ft[:, -self.modes:, -self.modes:, :self.modes]
 
             # Multiply Fourier modes with weight matrices and add biases
             xwb_tl = tf.add(tf.multiply(m_tl, self.w_tl), self.b_tl)
@@ -477,17 +468,29 @@ class FourierLayer(tf.keras.layers.Layer):
             xwb_br = tf.add(tf.multiply(m_br, self.w_br), self.b_br)
 
             # Recombine into one signal
-            xwb_t = tf.concat([xwb_tl, xwb_tr], axis=-1)
-            xwb_b = tf.concat([xwb_bl, xwb_br], axis=-1)
-            xwb = tf.concat([xwb_t, xwb_b], axis=-2)
+            xwb_t = tf.concat([xwb_tl, xwb_tr], axis=1)
+            xwb_b = tf.concat([xwb_bl, xwb_br], axis=1)
+            xwb = tf.concat([xwb_t, xwb_b], axis=2)
+
+            # Pad to match output shape
+            xwb_shape = tf.shape(xwb)
+            in_shape = tf.shape(inputs)
+            paddings = [[0, 0],  # Batch
+                        [0, in_shape[1] - xwb_shape[1]],  # X
+                        [0, in_shape[2] - xwb_shape[2]],  # Y
+                        [0, self.out_width - xwb_shape[3]]]  # T
+            xwb = tf.pad(xwb, paddings,
+                         "CONSTANT",
+                         constant_values=0)
+
         # Otherwise handle the signal normally
         else:
             xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
 
-        # Inverse FFT, transpose back into right shape and return
-        x_r = tf.signal.irfft2d(xwb, fft_length=[input_shape[1],
-                                                 input_shape[2]])
-        return tf.transpose(x_r, perm=[0, 2, 3, 1])
+        # Inverse FFT and return
+        # See earlier comment on rfft3d to explain this weirdness
+        x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
+        return tf.math.real(x_r)
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
