@@ -434,8 +434,10 @@ class FourierLayer(tf.keras.layers.Layer):
             self.b_br = init_bias(wb_shape)
         else:
             # Transform a dummy tensor of zeros to get the weight shape
-            x = tf.complex(tf.zeros(input_shape[1:]),
-                           tf.zeros(input_shape[1:]))
+            x_shape = input_shape[1:].as_list()
+            x_shape[-1] -= 2
+            x = tf.complex(tf.zeros(x_shape),
+                           tf.zeros(x_shape))
             x_ft = tf.signal.fft3d(x)
             wb_shape = tf.shape(x_ft)
 
@@ -448,10 +450,10 @@ class FourierLayer(tf.keras.layers.Layer):
     # 2: y value
     # 3: t value
     def call(self, inputs):
-        # Fourier transform on inputs (weights and bias weights are already complex numbers)
+        # Fourier transform on inputs with (x, y) grid removed from the last input channel
         # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
         # Use fft3d instead for now and just ignore the imaginary part
-        x = tf.complex(inputs, inputs)
+        x = tf.complex(inputs[..., :-2], inputs[..., :-2])
         x_ft = tf.math.real(tf.signal.fft3d(x))
 
         # Drop Fourier modes as a regularization measure
@@ -487,10 +489,10 @@ class FourierLayer(tf.keras.layers.Layer):
         else:
             xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
 
-        # Inverse FFT and return
+        # Inverse FFT, take real part, append (x, y) grid and return
         # See earlier comment on rfft3d to explain this weirdness
         x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
-        return tf.math.real(x_r)
+        return tf.concat([tf.math.real(x_r), inputs[..., -2:]], -1)
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
