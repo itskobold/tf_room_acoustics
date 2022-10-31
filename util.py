@@ -49,7 +49,7 @@ def timedelta_to_str(timedelta):
 # Get neural network input shape from data shape (X, Y, T).
 def input_shape_from_data_shape(data_shape,
                                 t_lookback=cfg.FNO_T_LOOKBACK):
-    return data_shape[:2] + [t_lookback + 2]  # +2 for the additional (x, y) coordinate encoded into layer depth
+    return data_shape[:2] + [t_lookback]
 
 
 # Get neural network output shape from data shape (X, Y, T).
@@ -115,6 +115,7 @@ def calc_error_heatmap(true_data,
     return error_grid
 
 
+# Create comma-separated string from array data
 def array_to_formatted_str(data):
     ret = ""
     for i, entry in enumerate(data):

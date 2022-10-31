@@ -278,23 +278,16 @@ class AcousticNet:
         num_solutions = data.shape[0]
         t_lookback = self.metadata["t_lookback"]
 
-        # Create linearly spaced grid
-        x_grid, y_grid = np.meshgrid(np.linspace(0, 1, x_len_samples),
-                                     np.linspace(0, 1, y_len_samples))
-        xy_grid = np.stack([x_grid, y_grid], axis=-1)
-
         # Loop through all solutions in dataset
         steps_to_predict = t_len_samples - t_lookback
         a = np.zeros(
-            [num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback + 2])  # +2 for (x, y) coord
+            [num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback])
         u = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
         for i, fdtd_sol in enumerate(data):
             # Loop through each solution and create training data for each time slice
             for t in range(steps_to_predict):
                 # Split data tensor and add to buffers (a, u)
-                # Also add (x, y) coordinate to feature labels a
-                a[i, t, :, :, :t_lookback] = fdtd_sol[:, :, t:t_lookback + t]
-                a[i, t, :, :, t_lookback:] = xy_grid
+                a[i, t] = fdtd_sol[:, :, t:t_lookback + t]
                 u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
 
         # Split datasets
@@ -435,7 +428,6 @@ class FourierLayer(tf.keras.layers.Layer):
         else:
             # Transform a dummy tensor of zeros to get the weight shape
             x_shape = input_shape[1:].as_list()
-            x_shape[-1] -= 2
             x = tf.complex(tf.zeros(x_shape),
                            tf.zeros(x_shape))
             x_ft = tf.signal.fft3d(x)
@@ -450,10 +442,10 @@ class FourierLayer(tf.keras.layers.Layer):
     # 2: y value
     # 3: t value
     def call(self, inputs):
-        # Fourier transform on inputs with (x, y) grid removed from the last input channel
+        # Fourier transform on inputs
         # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
         # Use fft3d instead for now and just ignore the imaginary part
-        x = tf.complex(inputs[..., :-2], inputs[..., :-2])
+        x = tf.complex(inputs, inputs)
         x_ft = tf.math.real(tf.signal.fft3d(x))
 
         # Drop Fourier modes as a regularization measure
@@ -489,10 +481,10 @@ class FourierLayer(tf.keras.layers.Layer):
         else:
             xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
 
-        # Inverse FFT, take real part, append (x, y) grid and return
+        # Inverse FFT, take real part and return
         # See earlier comment on rfft3d to explain this weirdness
         x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
-        return tf.concat([tf.math.real(x_r), inputs[..., -2:]], -1)
+        return tf.math.real(x_r)
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
