@@ -2,6 +2,7 @@ import numpy as np
 import config as cfg
 import json
 import pickle
+from pathlib import Path
 
 # Constants
 SIDE_LEFT = 0
@@ -123,6 +124,11 @@ def array_to_formatted_str(data):
         if i + 1 < len(data):
             ret += ", "
     return ret
+
+
+# Create folder at path
+def create_folder(folder_path):
+    Path(folder_path).mkdir(parents=True, exist_ok=True)
 
 
 # Load .json from file.

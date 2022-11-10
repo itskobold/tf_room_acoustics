@@ -1,12 +1,10 @@
 import numpy as np
 import config as cfg
-from pathlib import Path
+import util
 import scipy.io.wavfile as wavf
 import matplotlib.pyplot as plt
 import matplotlib.animation as mpl_anim
 import matplotlib as mpl
-
-import util
 
 mpl.use("Qt5Agg")
 
@@ -22,9 +20,9 @@ class Renderer:
     def get_impulse_response(self,
                              data,
                              xy_pos,
+                             sample_rate,
                              norm=False,
-                             file_name_out=None,
-                             sample_rate=cfg.IR_SAMPLE_RATE):
+                             file_name_out=None):
         x_pos = xy_pos[0]
         y_pos = xy_pos[1]
         print(f"Obtaining impulse response at {x_pos}, {y_pos}...")
@@ -80,7 +78,7 @@ class Renderer:
         # Create image object
         x_len = self.manager.metadata["dim_lengths"][0] / 2
         y_len = self.manager.metadata["dim_lengths"][1] / 2
-        im = plt.imshow(data, cmap=colormap, origin="lower",
+        im = plt.imshow(np.swapaxes(data, 0, 1), cmap=colormap, origin="lower",
                         extent=[-x_len, x_len, -y_len, y_len],
                         vmax=vmax, vmin=vmin)
 
@@ -129,6 +127,7 @@ class Renderer:
     # Create animation from sound field data
     def animate_sound_field(self,
                             data,
+                            mesh,
                             file_name_out,
                             title=None,
                             colormap=cfg.ANIM_COLORMAP,
@@ -137,6 +136,7 @@ class Renderer:
 
         # Do animation
         anim = self.animation(data=data,
+                              mesh=mesh,
                               ax_labels=["X (meters)", "Y (meters)", "Pressure"],
                               title=title,
                               colormap=colormap,
@@ -150,9 +150,11 @@ class Renderer:
     def animate_sound_field_difference(self,
                                        true_data,
                                        pred_data,
+                                       mesh,
                                        file_name_out,
                                        title=None,
                                        colormap=cfg.ANIM_COLORMAP,
+                                       mesh_colormap=cfg.MESH_ANIM_COLORMAP,
                                        fps=cfg.ANIM_FPS):
         print(f"Animating difference between true and predicted data '{file_name_out}'.")
 
@@ -165,9 +167,11 @@ class Renderer:
 
         # Do animation
         anim = self.animation(data=true_data - pred_data,
+                              mesh=mesh,
                               ax_labels=["X (meters)", "Y (meters)", "Diff."],
                               title=title,
                               colormap=colormap,
+                              mesh_colormap=mesh_colormap,
                               fps=fps,
                               scale_cb=True)
 
@@ -177,9 +181,11 @@ class Renderer:
     # Create animation from data in form (x, y, t)
     def animation(self,
                   data,
+                  mesh,
                   ax_labels,
                   title=None,
                   colormap=cfg.ANIM_COLORMAP,
+                  mesh_colormap=cfg.MESH_ANIM_COLORMAP,
                   fps=cfg.ANIM_FPS,
                   max_frames=cfg.ANIM_MAX_FRAMES,
                   scale_cb=False):
@@ -195,12 +201,25 @@ class Renderer:
         # Create image object
         x_len = self.manager.metadata["dim_lengths"][0] / 2
         y_len = self.manager.metadata["dim_lengths"][1] / 2
-        im = plt.imshow(data[0], interpolation="spline36", cmap=colormap,
-                        origin="lower", extent=[-x_len, x_len, -y_len, y_len])
+        extent = [-x_len, x_len, -y_len, y_len]
+        im_u = plt.imshow(np.swapaxes(data[0], 0, 1),
+                          cmap=colormap,
+                          origin="lower",
+                          extent=extent)
 
-        # Set colorbar
-        cb = fig.colorbar(im, shrink=0.5, aspect=8)
-        cb.ax.set_title(ax_labels[2], y=-0.1)
+        # Plot mesh over the top
+        mesh[mesh < 0] = np.nan  # Make free space areas transparent
+        im_m = plt.imshow(np.swapaxes(mesh, 0, 1),
+                          cmap=mesh_colormap,
+                          origin="lower",
+                          extent=extent,
+                          vmax=1, vmin=0)
+
+        # Set colorbars
+        cb_m = fig.colorbar(im_m, shrink=0.5, aspect=8)
+        cb_m.ax.set_title("Abs.", y=-0.1)
+        cb_u = fig.colorbar(im_u, shrink=0.5, aspect=8)
+        cb_u.ax.set_title(ax_labels[2], y=-0.1)
         plt.tight_layout()
 
         print("Creating animation.", end="")
@@ -214,8 +233,8 @@ class Renderer:
             # Get data slice
             data_slice = data[:, :, t]
 
-            # Set image array data - need to swap axes here for some reason
-            im.set_array(np.swapaxes(data_slice, 0, 1))
+            # Set image array data, swap axes so X is horizontal axis and Y is vertical
+            im_u.set_array(np.swapaxes(data_slice, 0, 1))
 
             # Rescale colorbar
             if scale_cb:
@@ -224,8 +243,8 @@ class Renderer:
             else:
                 vmin, vmax = -1, 1
             lim = max([vmin, vmax])
-            im.set_clim(vmax=lim, vmin=-lim)
-            return [im]
+            im_u.set_clim(vmax=lim, vmin=-lim)
+            return [im_u]
 
         # Create animation
         anim = mpl_anim.FuncAnimation(fig,
@@ -240,13 +259,13 @@ class Renderer:
     def save_impulse_response(self,
                               file_name_out,
                               ir,
-                              sample_rate=cfg.IR_SAMPLE_RATE):
+                              sample_rate):
         # Make impulse response folder
         ir_path = f"{self.manager.get_proj_path()}ir/"
-        Path(ir_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(ir_path)
 
         # Save as .wav
-        wavf.write(f"{ir_path}{file_name_out}.wav", sample_rate, ir)
+        wavf.write(f"{ir_path}{file_name_out}.wav", int(sample_rate), ir)
         print(f"Saved impulse response as '{file_name_out}.wav'.\n")
 
     # Save plot as .png file.
@@ -255,7 +274,7 @@ class Renderer:
                   plot):
         # Make plot folder
         plot_path = f"{self.manager.get_proj_path()}plot/"
-        Path(plot_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(plot_path)
 
         # Save plot
         file_path = f"{plot_path}{file_name_out}.png"
@@ -269,7 +288,7 @@ class Renderer:
                        fps=cfg.ANIM_FPS):
         # Make anim folder
         anim_path = f"{self.manager.get_proj_path()}anim/"
-        Path(anim_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(anim_path)
 
         # Save animation
         file_path = f"{anim_path}{file_name_out}.mp4"

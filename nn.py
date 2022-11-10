@@ -5,7 +5,6 @@ import tensorflow as tf
 import kormos
 from sklearn.utils import shuffle
 from datetime import datetime
-from pathlib import Path
 
 
 # Class for managing neural networks for solving 2D acoustic wave equation.
@@ -44,9 +43,9 @@ class AcousticNet:
     # Save model and weights to file.
     def save_model(self,
                    model_name_out):
-        # Make model & parent directory
+        # Make model & folder
         model_path = f"{self.manager.get_proj_path()}models/{model_name_out}/"
-        Path(model_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(model_path)
 
         # Save model and weights
         util.save_json(f"{model_path}/model.json", self.model.to_json())
@@ -312,7 +311,7 @@ class AcousticNet:
                   file_name_out):
         # Make folder
         file_path = f"{self.manager.get_proj_path()}pred/"
-        Path(file_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(file_path)
 
         # Save data
         full_path = f"{file_path}{file_name_out}.pkl"

@@ -1,10 +1,9 @@
 import config as cfg
 import util
-import icbc
 import numpy as np
 from datetime import datetime
-from pathlib import Path
 from scipy.stats.qmc import LatinHypercube
+from scipy.signal import ricker
 
 
 # Class for managing FDTD simulation
@@ -21,7 +20,8 @@ class FDTD:
     # Run acoustic finite-difference time domain simulation
     def run(self,
             file_name_out,
-            num_solutions=cfg.FDTD_NUM_SOLUTIONS,
+            num_meshes=cfg.FDTD_NUM_MESHES,
+            num_simulations=cfg.FDTD_NUM_SIMULATIONS,
             sims_per_file=cfg.FDTD_SOLUTIONS_PER_FILE,
             round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
         print(f"Starting FDTD simulation '{file_name_out}'...")
@@ -29,161 +29,137 @@ class FDTD:
         # Init metadata dict
         metadata = {}
 
-        # Get grid spacing and system sample rate
-        lmb = np.sqrt(0.5)
-        grid_spacing = self.manager.metadata["c"] / self.f_max / self.ppw
-        dt = lmb * grid_spacing / self.manager.metadata["c"]
-
         # Readability
+        c = self.manager.metadata["c"]
         x_len = self.manager.metadata["dim_lengths"][0]
         y_len = self.manager.metadata["dim_lengths"][1]
         t_len = self.manager.metadata["dim_lengths"][2]
 
+        # Get grid spacing and system sample rate
+        lmb = np.sqrt(0.5)
+        dx = c / self.f_max / self.ppw
+        dt = lmb * dx / c
+
         # Work out the dimensions of the FDTD grid
         # Add 2 to each spatial dimension to include boundary nodes
-        x_len_samples = int(np.ceil(x_len / grid_spacing)) + 2
-        y_len_samples = int(np.ceil(y_len / grid_spacing)) + 2
-        t_len_samples = int(np.ceil(t_len / dt))
-        metadata["dim_lengths_samples"] = x_len_samples, y_len_samples, t_len_samples
-
-        # Init constants for finite difference calculation
-        a = 2 - (4 * lmb ** 2)
-        b = lmb ** 2
-        c = -1
+        n_x = int(np.ceil(x_len / dx)) + 2
+        n_y = int(np.ceil(y_len / dx)) + 2
+        n_t = int(np.ceil(t_len / dt))
+        metadata["dim_lengths_samples"] = n_x, n_y, n_t
 
         # Init empty array
         def init_array():
-            return np.zeros([sims_per_file,  # TODO: make sizing dynamic
-                             x_len_samples,
-                             y_len_samples,
-                             t_len_samples])
+            return np.zeros([sims_per_file, n_x, n_y, n_t])
 
-        # Start timer for entire computation
-        t0_all = datetime.now()
-
-        # Loop for number of solutions to be generated
         data = init_array()
+
+        # Prepare counters and start timer for entire computation
         solution_index = 0
         total_solution_index = 0
         file_num = 0
-        for i in range(num_solutions):
-            # Get IC/BC points
-            ic_pos = self.sample_collocation_point()
-            # ic_x = np.random.randint(1, x_len_samples)
-            # ic_y = np.random.randint(1, y_len_samples)
-            # ic_pos = np.array([ic_x, ic_y])
-            bc_abs = self.sample_boundary_absorption_coeff(round_bc_coeffs)
+        t0_all = datetime.now()
 
-            print(f"Running FDTD simulation {i + 1}/{num_solutions}: "
-                  f"IC {ic_pos}, BC = {bc_abs}", end='')
+        # Loop for number of meshes to be generated
+        # TODO: better mesh generation
+        for mesh_id in range(num_meshes):
+            # Create mesh and save it
+            mesh = self.create_mesh(metadata["dim_lengths_samples"],
+                                    round_bc_coeffs=round_bc_coeffs)
+            self.save_mesh(mesh,
+                           file_name_out=file_name_out,
+                           mesh_id=mesh_id)
 
-            # Apply initial condition to pressure matrix at time step 0
-            for x_ in range(x_len_samples):
-                for y_ in range(y_len_samples):
-                    x_val = x_ / x_len_samples * x_len
-                    y_val = y_ / y_len_samples * y_len
-                    x_val -= x_len / 2
-                    y_val -= y_len / 2
-                    p_ic = icbc.gaussian_ic(x_val, y_val,
-                                            impulse_xy=ic_pos,
-                                            impulse_v=grid_spacing ** 2)
+            # Loop for number of solutions to be generated
+            for sim_id in range(num_simulations):
+                # Get IC point
+                ic_pos = self.sample_collocation_point(mesh)
+                ic_pos_samples = self.manager.util.real_to_sample_pos(ic_pos,
+                                                                      metadata["dim_lengths_samples"])
+                print(f"Mesh {mesh_id + 1}/{num_meshes}: running FDTD simulation {sim_id + 1}/{num_simulations} "
+                      f"(IC = {util.array_to_formatted_str(ic_pos)})", end='')
 
-                    # Set pressure
-                    data[solution_index][x_, y_, 0] = p_ic
+                # Set sample rate
+                metadata["sample_rate"] = 1 / dt
 
-            # Rescale between [0, 1]
-            p_min = np.amin(data[solution_index][:, :, 0])
-            p_max = np.amax(data[solution_index][:, :, 0])
-            data[solution_index][:, :, 0] = (data[solution_index][:, :, 0] - p_min) / (p_max - p_min)
+                # Create IC
+                u_in = np.zeros(n_t)
+                ricker_len = int(np.ceil(5 * metadata["sample_rate"] / self.f_max))
+                u_in[:ricker_len] = ricker(points=ricker_len, a=4)
+                u_in *= 1 / max(np.abs(u_in))
 
-            # Dirac
-            # data[solution_index][ic_x, ic_y, 0] = 1
+                # Create gamma and interior masks
+                gam_mask = np.copy(mesh)
+                gam_mask[gam_mask < 0] = 0
+                in_mask = np.copy(gam_mask)
+                in_mask[in_mask > 0] = 1
+                in_mask = np.ones_like(in_mask) - in_mask
 
-            # Start timer for this simulation
-            t0 = datetime.now()
-            for step in range(1, t_len_samples - 1):
-                if (step - 1) % cfg.ANIM_FPS == 0:
-                    print(".", end='')
+                # Create K map (interior neighbors)
+                k_map = np.zeros_like(in_mask)
+                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[2:n_x, 1:n_y - 1]
+                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[0:n_x - 2, 1:n_y - 1]
+                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[1:n_x - 1, 2:n_y]
+                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[1:n_x - 1, 0:n_y - 2]
+                k_map *= in_mask
 
-                # Create matrices for readability
-                prev_p = data[solution_index][:, :, step - 1]
-                current_p = data[solution_index][:, :, step]
-                next_p = data[solution_index][:, :, step + 1]
+                # Create gamma map (absorption)
+                g_map = np.zeros_like(gam_mask)
+                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[2:n_x, 1:n_y - 1]
+                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[0:n_x - 2, 1:n_y - 1]
+                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[1:n_x - 1, 2:n_y]
+                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[1:n_x - 1, 0:n_y - 2]
+                g_map /= np.full_like(g_map, 4) - k_map
+                g_map[np.isnan(g_map)] = 0
 
-                # FD process
-                # TODO: use slices to make this more efficient/tidier, GPU implementation
-                for x in range(x_len_samples):
-                    for y in range(y_len_samples):
-                        # Bottom left corner
-                        if x == 0 and y == 0:
-                            next_p[x, y] = 0
-                        # Bottom right corner
-                        elif x == x_len_samples - 1 and y == 0:
-                            next_p[x, y] = 0
-                        # Top left corner
-                        elif x == 0 and y == y_len_samples - 1:
-                            next_p[x, y] = 0
-                        # Top right corner
-                        elif x == x_len_samples - 1 and y == y_len_samples - 1:
-                            next_p[x, y] = 0
-                        # Left boundary
-                        elif x == 0:
-                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_LEFT,
-                                                             boundary_abs=bc_abs,
-                                                             current_p=current_p,
-                                                             prev_p=prev_p,
-                                                             x=x, y=y)
-                        # Right boundary
-                        elif x == x_len_samples - 1:
-                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_RIGHT,
-                                                             boundary_abs=bc_abs,
-                                                             current_p=current_p,
-                                                             prev_p=prev_p,
-                                                             x=x, y=y)
-                        # Bottom boundary
-                        elif y == 0:
-                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_BOTTOM,
-                                                             boundary_abs=bc_abs,
-                                                             current_p=current_p,
-                                                             prev_p=prev_p,
-                                                             x=x, y=y)
-                        # Top boundary
-                        elif y == y_len_samples - 1:
-                            next_p[x, y] = icbc.absorbing_bc(util.SIDE_TOP,
-                                                             boundary_abs=bc_abs,
-                                                             current_p=current_p,
-                                                             prev_p=prev_p,
-                                                             x=x, y=y)
-                        # Within domain
-                        if x != 0 and x != x_len_samples - 1 and y != 0 and y != y_len_samples - 1:
-                            next_p[x, y] = a * current_p[x, y] + \
-                                           b * (current_p[x + 1, y] + current_p[x - 1, y] +
-                                                current_p[x, y + 1] + current_p[x, y - 1]) + \
-                                           c * prev_p[x, y]
+                # TODO
+                # g_map = np.divide(g_map, np.full_like(g_map, 4) - k_map,
+                #                   out=np.zeros_like(g_map), where=g_map != 0)
 
-                # Set pressure values for next time step
-                data[solution_index][:, :, step + 1] = next_p
+                # Start timer for this simulation
+                t0 = datetime.now()
+                for step in range(1, n_t - 1):
+                    if (step - 1) % 10 == 0:
+                        print(".", end='')
 
-            # Done with this simulation - print time in ms.
-            print(f"done. Took {round((datetime.now() - t0).total_seconds() * 1000)}ms.")
+                    # Readability
+                    prev_p = data[solution_index][..., step - 1]
+                    current_p = data[solution_index][..., step]
+                    next_p = data[solution_index][..., step + 1]
 
-            # Increment solution index and handle saving
-            solution_index += 1
-            if solution_index >= sims_per_file or i >= num_solutions - 1:
-                # Save FDTD data to file
-                self.save_data(data,
-                               file_name_out=file_name_out,
-                               file_num=file_num)
+                    # Update grid
+                    for x in range(n_x):
+                        for y in range(n_y):
+                            if k_map[x, y] > 0:
+                                rb = g_map[x, y] * (c * dt) / (2 * dx) * (4 - k_map[x, y])
+                                next_p[x, y] = 1 / (1 + rb) * \
+                                               ((2 - 0.5 * k_map[x, y]) * current_p[x, y] +
+                                                0.5 * (current_p[x + 1, y] + current_p[x - 1, y] +
+                                                       current_p[x, y + 1] + current_p[x, y - 1]) +
+                                                (rb - 1) * prev_p[x, y])
 
-                # Handle variables and clear pressure matrix
-                file_num += 1
-                solution_index = 0
-                data = init_array()
+                    # Inject source
+                    next_p[ic_pos_samples[0], ic_pos_samples[1]] += u_in[step + 1]
 
-            # Update simulation metadata
-            metadata[total_solution_index] = {"impulse_xy": ic_pos.tolist(),
-                                              "boundary_abs": bc_abs.tolist()}
-            total_solution_index += 1
+                # Done with this simulation - print time in ms.
+                print(f"done.\nTook {round((datetime.now() - t0).total_seconds() * 1000)}ms.")
+
+                # Increment solution index and handle saving
+                solution_index += 1
+                if solution_index >= sims_per_file or (sim_id >= num_simulations - 1 and mesh_id + 1 == num_meshes):
+                    # Save FDTD data to file
+                    self.save_data(data,
+                                   file_name_out=file_name_out,
+                                   file_num=file_num)
+
+                    # Handle variables and clear pressure matrix
+                    file_num += 1
+                    solution_index = 0
+                    data = init_array()
+
+                # Update simulation metadata
+                metadata[total_solution_index] = {"impulse_xy": ic_pos.tolist(),
+                                                  "mesh_id": mesh_id}
+                total_solution_index += 1
 
         # Stop timer for entire computation
         timedelta = datetime.now() - t0_all
@@ -203,7 +179,7 @@ class FDTD:
                   file_num):
         # Make folder
         file_path = f"{self.manager.get_proj_path()}fdtd/{file_name_out}/"
-        Path(file_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(file_path)
 
         # Save data
         full_path = f"{file_path}{file_num}.pkl"
@@ -216,46 +192,97 @@ class FDTD:
                       file_name_out):
         # Make folder
         file_path = f"{self.manager.get_proj_path()}fdtd/{file_name_out}/"
-        Path(file_path).mkdir(parents=True, exist_ok=True)
+        util.create_folder(file_path)
 
         # Save metadata
         full_path = f"{file_path}meta.json"
         util.save_json(f"{file_path}meta.json", metadata)
         print(f"Saved FDTD metadata as '{full_path}'.\n")
 
-    # Sample a set of (x, y) collocation points using LHC sampling.
-    def sample_collocation_points(self, n):
-        # Sample points
+    # Creates a mesh with randomly reflective surfaces
+    # TODO: better mesh generation
+    def create_mesh(self,
+                    dim_lengths_samples,
+                    mode="l",
+                    round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+        # Create empty domain
+        x_l = dim_lengths_samples[0]
+        y_l = dim_lengths_samples[1]
+        mesh = np.full([x_l, y_l], -1,
+                       dtype=self.manager.metadata["dtype"])
+
+        # Create walls
+        if mode == "square":
+            for i in range(4):
+                bc_abs = np.random.random()
+                if round_bc_coeffs:
+                    bc_abs = round(bc_abs, 2)
+
+                if i == 0:
+                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_abs)
+                elif i == 1:
+                    mesh[x_l - 1, :y_l - 1] = np.full([y_l - 1], bc_abs)
+                elif i == 2:
+                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_abs)
+                elif i == 3:
+                    mesh[1:x_l, y_l - 1] = np.full([x_l - 1], bc_abs)
+        elif mode == "l":
+            x_l2 = int(np.floor(x_l / 2))
+            y_l2 = int(np.floor(y_l / 2))
+
+            for i in range(6):
+                bc_abs = np.random.random()
+                if round_bc_coeffs:
+                    bc_abs = round(bc_abs, 2)
+
+                if i == 0:
+                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_abs)
+                elif i == 1:
+                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_abs)
+                elif i == 2:
+                    mesh[x_l - 1, :y_l2] = np.full([y_l2], bc_abs)
+                elif i == 3:
+                    mesh[x_l2 + 1:, y_l2] = np.full([x_l2], bc_abs)
+                elif i == 4:
+                    mesh[x_l2, y_l2:y_l - 1] = np.full([y_l2], bc_abs)
+                elif i == 5:
+                    mesh[1:x_l2 + 1, y_l - 1] = np.full([x_l2], bc_abs)
+            mesh[x_l2 + 1:, y_l2 + 1:] = np.zeros([x_l2, y_l2])
+
+        return mesh
+
+    # Save metadata as .json after all simulations are complete.
+    def save_mesh(self,
+                  mesh,
+                  file_name_out,
+                  mesh_id):
+        # Make folder
+        file_path = f"{self.manager.get_proj_path()}fdtd/{file_name_out}/mesh/"
+        util.create_folder(file_path)
+
+        # Save mesh data
+        full_path = f"{file_path}{mesh_id}.pkl"
+        util.save_data(full_path, mesh)
+        print(f"Mesh saved to '{full_path}'.")
+
+    # Sample an (x, y) collocation point in real-space using LHC sampling.
+    # Ensures the sampled point isn't within a mesh boundary.
+    def sample_collocation_point(self, mesh):
         lhc = LatinHypercube(d=2)
-        samples = lhc.random(n)
+        while True:
+            # Sample points
+            xy_real = lhc.random()[0]
 
-        # Map to real space and return
-        x_len = self.manager.metadata["dim_lengths"][0]
-        y_len = self.manager.metadata["dim_lengths"][1]
-        samples[:, 0] = samples[:, 0] * x_len - x_len / 2
-        samples[:, 1] = samples[:, 1] * y_len - y_len / 2
-        return samples
+            # Map to real space
+            x_len = self.manager.metadata["dim_lengths"][0]
+            y_len = self.manager.metadata["dim_lengths"][1]
+            xy_real[0] = xy_real[0] * x_len - x_len / 2
+            xy_real[1] = xy_real[1] * y_len - y_len / 2
 
-    # Sample just 1 (x, y) collocation point and return it.
-    def sample_collocation_point(self):
-        return self.sample_collocation_points(1)[0]
+            # Check if in boundary, break if not
+            xy_sample = self.manager.util.real_to_sample_pos(xy_pos_real=xy_real,
+                                                             dim_lengths_samples=np.shape(mesh))
+            if mesh[xy_sample] < 0:
+                break
 
-    # Sample a set of boundary absorption coefficients using LHC sampling.
-    @staticmethod
-    def sample_boundary_absorption_coeffs(n,
-                                          round_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
-        # Sample points
-        lhc = LatinHypercube(d=4)
-        bc_coeffs = lhc.random(n)
-
-        # Round sampled points
-        if round_coeffs:
-            bc_coeffs = np.around(bc_coeffs,
-                                  decimals=2)
-        return bc_coeffs
-
-    # Sample just 1 set of boundary absorption coefficients.
-    # Round to 2 decimal places if round is True.
-    def sample_boundary_absorption_coeff(self,
-                                         round_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
-        return self.sample_boundary_absorption_coeffs(1, round_coeffs)[0]
+        return xy_real
