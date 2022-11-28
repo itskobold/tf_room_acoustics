@@ -4,26 +4,27 @@ import numpy as np
 from datetime import datetime
 from scipy.stats.qmc import LatinHypercube
 from scipy.signal import ricker
+import glob
 
 
 # Class for managing FDTD simulation
 class FDTD:
     # Init FDTD settings
-    def __init__(self,
-                 manager,
-                 f_max=cfg.FDTD_F_MAX,
-                 ppw=cfg.FDTD_PPW):
+    def __init__(self, manager):
         self.manager = manager
-        self.f_max = f_max
-        self.ppw = ppw
 
     # Run acoustic finite-difference time domain simulation
     def run(self,
             file_name_out,
-            num_meshes=cfg.FDTD_NUM_MESHES,
-            num_simulations=cfg.FDTD_NUM_SIMULATIONS,
-            sims_per_file=cfg.FDTD_SOLUTIONS_PER_FILE,
-            round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+            mesh_dir,
+            ic_points,
+            sims_per_block=cfg.FDTD_SIMS_PER_BLOCK,
+            f_max=cfg.FDTD_F_MAX,
+            ppw=cfg.FDTD_PPW):
+        num_meshes = self.count_meshes_in_dir(mesh_dir)
+        num_sims = np.shape(ic_points)[1]
+        assert num_meshes == np.shape(ic_points)[0]
+
         print(f"Starting FDTD simulation '{file_name_out}'...")
 
         # Init metadata dict
@@ -31,25 +32,18 @@ class FDTD:
 
         # Readability
         c = self.manager.metadata["c"]
-        x_len = self.manager.metadata["dim_lengths"][0]
-        y_len = self.manager.metadata["dim_lengths"][1]
-        t_len = self.manager.metadata["dim_lengths"][2]
-
-        # Get grid spacing and system sample rate
-        lmb = np.sqrt(0.5)
-        dx = c / self.f_max / self.ppw
-        dt = lmb * dx / c
 
         # Work out the dimensions of the FDTD grid
         # Add 2 to each spatial dimension to include boundary nodes
-        n_x = int(np.ceil(x_len / dx)) + 2
-        n_y = int(np.ceil(y_len / dx)) + 2
-        n_t = int(np.ceil(t_len / dt))
+        dx, dt = self.get_dx_dt(f_max=f_max, ppw=ppw)
+        n_x, n_y, n_t = self.get_grid_dims(dx=dx, dt=dt)
         metadata["dim_lengths_samples"] = n_x, n_y, n_t
+        metadata["sample_rate"] = 1 / dt
+        metadata["sims_per_file"] = sims_per_block
 
         # Init empty array
         def init_array():
-            return np.zeros([sims_per_file, n_x, n_y, n_t])
+            return np.zeros([sims_per_block, n_x, n_y, n_t])
 
         data = init_array()
 
@@ -61,29 +55,21 @@ class FDTD:
 
         # Loop for number of meshes to be generated
         # TODO: better mesh generation
-        for mesh_id in range(num_meshes):
-            # Create mesh and save it
-            mesh = self.create_mesh(metadata["dim_lengths_samples"],
-                                    round_bc_coeffs=round_bc_coeffs)
-            self.save_mesh(mesh,
-                           file_name_out=file_name_out,
-                           mesh_id=mesh_id)
+        for i in range(num_meshes):
+            for j in range(num_sims):
+                # Load mesh
+                mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/{i}.mesh")
 
-            # Loop for number of solutions to be generated
-            for sim_id in range(num_simulations):
                 # Get IC point
-                ic_pos = self.sample_collocation_point(mesh)
-                ic_pos_samples = self.manager.util.real_to_sample_pos(ic_pos,
+                ic_pos_samples = self.manager.util.real_to_sample_pos(ic_points[i][j],
                                                                       metadata["dim_lengths_samples"])
-                print(f"Mesh {mesh_id + 1}/{num_meshes}: running FDTD simulation {sim_id + 1}/{num_simulations} "
-                      f"(IC = {util.array_to_formatted_str(ic_pos)})", end='')
 
-                # Set sample rate
-                metadata["sample_rate"] = 1 / dt
+                print(f"Mesh {i + 1}/{num_meshes}: running FDTD simulation {j + 1}/{num_sims} "
+                      f"(IC = {util.array_to_formatted_str(ic_points[i][j])})", end="")
 
                 # Create IC
                 u_in = np.zeros(n_t)
-                ricker_len = int(np.ceil(5 * metadata["sample_rate"] / self.f_max))
+                ricker_len = int(np.ceil(5 * metadata["sample_rate"] / f_max))
                 u_in[:ricker_len] = ricker(points=ricker_len, a=4)
                 u_in *= 1 / max(np.abs(u_in))
 
@@ -96,18 +82,18 @@ class FDTD:
 
                 # Create K map (interior neighbors)
                 k_map = np.zeros_like(in_mask)
-                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[2:n_x, 1:n_y - 1]
-                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[0:n_x - 2, 1:n_y - 1]
-                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[1:n_x - 1, 2:n_y]
-                k_map[1: n_x - 1, 1: n_y - 1] = k_map[1:n_x - 1, 1:n_y - 1] + in_mask[1:n_x - 1, 0:n_y - 2]
+                k_map[1: n_x - 1, 1: n_y - 1] += in_mask[2:n_x, 1:n_y - 1]
+                k_map[1: n_x - 1, 1: n_y - 1] += in_mask[0:n_x - 2, 1:n_y - 1]
+                k_map[1: n_x - 1, 1: n_y - 1] += in_mask[1:n_x - 1, 2:n_y]
+                k_map[1: n_x - 1, 1: n_y - 1] += in_mask[1:n_x - 1, 0:n_y - 2]
                 k_map *= in_mask
 
                 # Create gamma map (absorption)
                 g_map = np.zeros_like(gam_mask)
-                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[2:n_x, 1:n_y - 1]
-                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[0:n_x - 2, 1:n_y - 1]
-                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[1:n_x - 1, 2:n_y]
-                g_map[1: n_x - 1, 1: n_y - 1] = g_map[1:n_x - 1, 1:n_y - 1] + gam_mask[1:n_x - 1, 0:n_y - 2]
+                g_map[1: n_x - 1, 1: n_y - 1] += gam_mask[2:n_x, 1:n_y - 1]
+                g_map[1: n_x - 1, 1: n_y - 1] += gam_mask[0:n_x - 2, 1:n_y - 1]
+                g_map[1: n_x - 1, 1: n_y - 1] += gam_mask[1:n_x - 1, 2:n_y]
+                g_map[1: n_x - 1, 1: n_y - 1] += gam_mask[1:n_x - 1, 0:n_y - 2]
                 g_map /= np.full_like(g_map, 4) - k_map
                 g_map[np.isnan(g_map)] = 0
 
@@ -145,7 +131,7 @@ class FDTD:
 
                 # Increment solution index and handle saving
                 solution_index += 1
-                if solution_index >= sims_per_file or (sim_id >= num_simulations - 1 and mesh_id + 1 == num_meshes):
+                if solution_index >= sims_per_block or i + 1 == num_meshes:
                     # Save FDTD data to file
                     self.save_data(data,
                                    file_name_out=file_name_out,
@@ -157,8 +143,8 @@ class FDTD:
                     data = init_array()
 
                 # Update simulation metadata
-                metadata[total_solution_index] = {"impulse_xy": ic_pos.tolist(),
-                                                  "mesh_id": mesh_id}
+                metadata[total_solution_index] = {"impulse_xy": ic_points[i][j].tolist(),
+                                                  "i": i}
                 total_solution_index += 1
 
         # Stop timer for entire computation
@@ -199,12 +185,54 @@ class FDTD:
         util.save_json(f"{file_path}meta.json", metadata)
         print(f"Saved FDTD metadata as '{full_path}'.\n")
 
-    # Creates a mesh with randomly reflective surfaces
+    # Creates and saves a set of meshes
+    def create_meshes(self,
+                      file_name_out,
+                      dim_lengths_samples,
+                      bc_coeffs,
+                      mesh_shape=cfg.FDTD_MESH_SHAPE):
+        # Assertions
+        if mesh_shape == "rect":
+            assert np.shape(bc_coeffs)[1] == 4
+        elif mesh_shape == "l":
+            assert np.shape(bc_coeffs)[1] == 6
+        else:
+            print("Mesh shape not recognised, meshes will not be created.")
+            return
+        print("Creating meshes...")
+
+        num_meshes = np.shape(bc_coeffs)[0]
+        for i in range(num_meshes):
+            mesh = self.create_mesh(dim_lengths_samples,
+                                    mesh_shape=mesh_shape,
+                                    bc_coeffs=bc_coeffs[i])
+            self.save_mesh(mesh,
+                           file_name_out=file_name_out,
+                           mesh_id=i)
+
+    # Get sampling density of FDTD grid
+    def get_dx_dt(self,
+                  f_max=cfg.FDTD_F_MAX,
+                  ppw=cfg.FDTD_PPW):
+        c = self.manager.metadata["c"]
+        lmb = np.sqrt(0.5)
+        dx = c / f_max / ppw
+        dt = lmb * dx / c
+        return dx, dt
+
+    # Get size of FDTD grid from real-space (X, Y, T) measurements in meters & seconds
+    def get_grid_dims(self, dx, dt):
+        n_x = int(np.ceil(self.manager.metadata["dim_lengths"][0] / dx)) + 2
+        n_y = int(np.ceil(self.manager.metadata["dim_lengths"][1] / dx)) + 2
+        n_t = int(np.ceil(self.manager.metadata["dim_lengths"][2] / dt))
+        return n_x, n_y, n_t
+
+    # Creates a mesh with reflective surfaces specified by bc_coeffs
     # TODO: better mesh generation
     def create_mesh(self,
                     dim_lengths_samples,
-                    mode="l",
-                    round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+                    mesh_shape,
+                    bc_coeffs):
         # Create empty domain
         x_l = dim_lengths_samples[0]
         y_l = dim_lengths_samples[1]
@@ -212,41 +240,33 @@ class FDTD:
                        dtype=self.manager.metadata["dtype"])
 
         # Create walls
-        if mode == "square":
+        if mesh_shape == "rect":
             for i in range(4):
-                bc_abs = np.random.random()
-                if round_bc_coeffs:
-                    bc_abs = round(bc_abs, 2)
-
                 if i == 0:
-                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_abs)
+                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_coeffs[i])
                 elif i == 1:
-                    mesh[x_l - 1, :y_l - 1] = np.full([y_l - 1], bc_abs)
+                    mesh[x_l - 1, :y_l - 1] = np.full([y_l - 1], bc_coeffs[i])
                 elif i == 2:
-                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_abs)
+                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_coeffs[i])
                 elif i == 3:
-                    mesh[1:x_l, y_l - 1] = np.full([x_l - 1], bc_abs)
-        elif mode == "l":
+                    mesh[1:x_l, y_l - 1] = np.full([x_l - 1], bc_coeffs[i])
+        elif mesh_shape == "l":
             x_l2 = int(np.floor(x_l / 2))
             y_l2 = int(np.floor(y_l / 2))
 
             for i in range(6):
-                bc_abs = np.random.random()
-                if round_bc_coeffs:
-                    bc_abs = round(bc_abs, 2)
-
                 if i == 0:
-                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_abs)
+                    mesh[0, 1:y_l] = np.full([y_l - 1], bc_coeffs[i])
                 elif i == 1:
-                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_abs)
+                    mesh[:x_l - 1, 0] = np.full([x_l - 1], bc_coeffs[i])
                 elif i == 2:
-                    mesh[x_l - 1, :y_l2] = np.full([y_l2], bc_abs)
+                    mesh[x_l - 1, :y_l2] = np.full([y_l2], bc_coeffs[i])
                 elif i == 3:
-                    mesh[x_l2 + 1:, y_l2] = np.full([x_l2], bc_abs)
+                    mesh[x_l2 + 1:, y_l2] = np.full([x_l2], bc_coeffs[i])
                 elif i == 4:
-                    mesh[x_l2, y_l2:y_l - 1] = np.full([y_l2], bc_abs)
+                    mesh[x_l2, y_l2:y_l - 1] = np.full([y_l2], bc_coeffs[i])
                 elif i == 5:
-                    mesh[1:x_l2 + 1, y_l - 1] = np.full([x_l2], bc_abs)
+                    mesh[1:x_l2 + 1, y_l - 1] = np.full([x_l2], bc_coeffs[i])
             mesh[x_l2 + 1:, y_l2 + 1:] = np.zeros([x_l2, y_l2])
 
         return mesh
@@ -257,17 +277,40 @@ class FDTD:
                   file_name_out,
                   mesh_id):
         # Make folder
-        file_path = f"{self.manager.get_proj_path()}fdtd/{file_name_out}/mesh/"
+        file_path = f"{self.manager.get_proj_path()}mesh/{file_name_out}/"
         util.create_folder(file_path)
 
         # Save mesh data
-        full_path = f"{file_path}{mesh_id}.pkl"
+        full_path = f"{file_path}{mesh_id}.mesh"
         util.save_data(full_path, mesh)
         print(f"Mesh saved to '{full_path}'.")
 
+    # Get number of .mesh files in directory
+    def count_meshes_in_dir(self,
+                            mesh_dir):
+        return len(glob.glob1(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/", "*.mesh"))
+
+    # Sample a set of (x, y) collocation points in real-space for a set of meshes.
+    def sample_ic_points(self,
+                         mesh_dir,
+                         num_sims_per_mesh):
+        num_meshes = self.count_meshes_in_dir(mesh_dir)
+        ic_points = np.zeros([num_meshes, num_sims_per_mesh, 2])
+        for i in range(num_meshes):
+            mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/{i}.mesh")
+            for j in range(num_sims_per_mesh):
+                # Avoid duplicate entries
+                while True:
+                    ic_point = self.sample_collocation_point(mesh)
+                    if ic_point not in ic_points:
+                        ic_points[i, j] = ic_point
+                        break
+        return ic_points
+
     # Sample an (x, y) collocation point in real-space using LHC sampling.
     # Ensures the sampled point isn't within a mesh boundary.
-    def sample_collocation_point(self, mesh):
+    def sample_collocation_point(self,
+                                 mesh):
         lhc = LatinHypercube(d=2)
         while True:
             # Sample points
@@ -286,3 +329,42 @@ class FDTD:
                 break
 
         return xy_real
+
+    # Sample a set of boundary absorption coefficients sized depending on mesh shape
+    def sample_bc_coeffs(self,
+                         num_meshes,
+                         mesh_shape=cfg.FDTD_MESH_SHAPE,
+                         absorption=cfg.FDTD_BOUNDARY_ABSORPTION,
+                         round_bc_coeffs=cfg.FDTD_ROUND_BC_COEFFS):
+        def get_bc_abs():
+            bc_abs = np.random.random()
+            if round_bc_coeffs:
+                bc_abs = round(bc_abs, 2)
+            return bc_abs
+
+        # Create array
+        if mesh_shape == "rect":
+            count = 4
+        elif mesh_shape == "l":
+            count = 6
+        else:
+            print("Mesh shape not recognised, no boundary coefficients will be produced.")
+            return
+        bc_coeffs = np.zeros([num_meshes, count])
+
+        # No boundary absorption - return array of zeros
+        if not absorption:
+            return bc_coeffs
+
+        # Fill with absorption coefficients
+        for i in range(num_meshes):
+            # Avoid duplicate entries
+            while True:
+                bc_abs = np.zeros(4)
+                for j in range(count):
+                    bc_abs[j] = get_bc_abs()
+                if bc_abs not in bc_coeffs[i]:
+                    bc_coeffs[i] = bc_abs
+                    break
+
+        return bc_coeffs

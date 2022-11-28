@@ -16,8 +16,10 @@ class AcousticNet:
         # Init variables
         self.model = None
         self.train_X = None
+        self.train_mesh_X = None
         self.train_y = None
         self.val_X = None
+        self.val_mesh_X = None
         self.val_y = None
         self.metadata = {}
 
@@ -33,7 +35,9 @@ class AcousticNet:
         self.model = tf.keras.models.model_from_json(model_json,
                                                      custom_objects={
                                                          "BatchOptimizedModel": kormos.models.BatchOptimizedModel,
-                                                         "FourierLayer": FourierLayer})
+                                                         "FourierLayer": FourierLayer,
+                                                         "ConcatAbsorption": ConcatAbsorption,
+                                                         "ConstrainOutput": ConstrainOutput})
         self.model.load_weights(model_path)
 
         # Load metadata
@@ -68,6 +72,7 @@ class AcousticNet:
 
         # Set metadata parameters
         self.metadata["input_shape"] = input_shape
+        self.metadata["mesh_input_shape"] = input_shape[:2] + [1]
         self.metadata["output_shape"] = output_shape
         self.metadata["t_lookback"] = t_lookback
 
@@ -78,8 +83,14 @@ class AcousticNet:
                   f"t_lookback = {self.metadata['t_lookback']}, "
                   f"input_shape (X, Y) = {self.metadata['input_shape'][:2]}.")
 
-        # Create layers
+        # Create layer for mesh input
+        mesh_input = tf.keras.Input(self.metadata["mesh_input_shape"])
+
+        # Create solution input & list for layers
         layers = [tf.keras.Input(self.metadata["input_shape"])]
+
+        # Concatenate absorption map with solution layers
+        layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
 
         # Append up projection layer (linear, no activation)
         layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
@@ -88,6 +99,7 @@ class AcousticNet:
         for i in range(num_hidden_layers):
             last_layer = layers[-1]
             fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
+                                         fft_type="3d",
                                          in_width=width,
                                          out_width=width,
                                          modes=modes)(last_layer)
@@ -104,8 +116,11 @@ class AcousticNet:
         layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
                                             activation=None)(layers[-1]))
 
+        # Append transformation layer to constrain predictions within boundaries
+        layers.append(ConstrainOutput(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
+
         # Create model and print summary
-        self.model = kormos.models.BatchOptimizedModel(inputs=layers[0],
+        self.model = kormos.models.BatchOptimizedModel(inputs=[layers[0], mesh_input],
                                                        outputs=layers[-1])
         self.model.summary()
 
@@ -113,7 +128,8 @@ class AcousticNet:
     # Remember to create a model with init_model or load one with load_model before fitting.
     # Optimizer mode can be "adam" or "l-bfgs-b".
     def fit_model(self,
-                  train_data_dir,
+                  data_dir,
+                  mesh_dir,
                   num_files,
                   optimizer_mode=cfg.NN_OPTIMIZER,
                   iterations=cfg.NN_ITERATIONS,
@@ -142,30 +158,35 @@ class AcousticNet:
 
             # Loop through all files to train from
             for file_num in range(num_files):
-                print(f"Training on data block {block_ids[file_num]} "
-                      f"({file_num + 1}/{num_files})...")
+                block_id = block_ids[file_num]
+                print(f"Training on data block {block_id} ({file_num + 1}/{num_files})...")
 
                 # Load data from file
-                self.init_data(
-                    util.load_data(f"{self.manager.get_proj_path()}fdtd/{train_data_dir}/{block_ids[file_num]}.pkl"))
+                self.init_data(util.load_data(f"{self.manager.get_proj_path()}fdtd/{data_dir}/{block_id}.pkl"),
+                               mesh_dir=mesh_dir,
+                               file_num=file_num)
 
                 # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
                 train_X = self.prepare_dataset_for_model(self.train_X)
+                train_mesh_X = self.prepare_dataset_for_model(self.train_mesh_X)
                 train_y = self.prepare_dataset_for_model(self.train_y)
-                train_X, train_y, = shuffle(train_X, train_y,
-                                            random_state=self.manager.metadata["seed"])
+                train_X, train_mesh_X, train_y, = shuffle(train_X, train_mesh_X, train_y,
+                                                          random_state=self.manager.metadata["seed"])
                 num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
 
                 # Do the same for validation data (if any exists)
-                if self.val_X is not None and self.val_y is not None:
+                if self.val_X is not None and \
+                        self.val_mesh_X is not None and \
+                        self.val_y is not None:
                     use_val = True
                     val_X = self.prepare_dataset_for_model(self.val_X)
+                    val_mesh_X = self.prepare_dataset_for_model(self.val_mesh_X)
                     val_y = self.prepare_dataset_for_model(self.val_y)
                     val_X, val_y = shuffle(val_X, val_y,
                                            random_state=self.manager.metadata["seed"])
                     big_batch_size_val = int(np.floor(np.shape(val_X)[0] / num_big_batches))
                 else:
-                    use_val, val_X, val_y, big_batch_size_val = False, None, None, None
+                    use_val, val_X, val_mesh_X, val_y, big_batch_size_val = False, None, None, None, None
 
                 # Loop through big batches
                 for big_batch in range(num_big_batches):
@@ -175,13 +196,15 @@ class AcousticNet:
                     # Prepare validation data
                     if use_val:
                         end_val = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size_val
-                        val_data = (val_X[big_batch * big_batch_size_val:end_val],
+                        val_data = ([val_X[big_batch * big_batch_size_val:end_val],
+                                     val_mesh_X[big_batch * big_batch_size_val:end_val]],
                                     val_y[big_batch * big_batch_size_val:end_val])
                     else:
                         val_data = None
 
                     if optimizer_mode == "adam":
-                        self.model.fit(train_X[big_batch * big_batch_size:end],
+                        self.model.fit([train_X[big_batch * big_batch_size:end],
+                                        train_mesh_X[big_batch * big_batch_size:end]],
                                        train_y[big_batch * big_batch_size:end],
                                        batch_size=batch_size,
                                        epochs=iterations + initial_epoch,
@@ -189,7 +212,8 @@ class AcousticNet:
                                        validation_data=val_data)
                         initial_epoch += iterations
                     else:
-                        self.model.fit(train_X[big_batch * big_batch_size:end],
+                        self.model.fit([train_X[big_batch * big_batch_size:end],
+                                        train_mesh_X[big_batch * big_batch_size:end]],
                                        train_y[big_batch * big_batch_size:end],
                                        batch_size=batch_size,
                                        epochs=iterations,
@@ -262,13 +286,20 @@ class AcousticNet:
     # Create datasets from data and set metadata parameters
     def init_data(self,
                   data,
+                  mesh_dir,
+                  file_num,
                   val_split=cfg.NN_VALIDATION_SPLIT):
-        self.train_X, self.train_y, self.val_X, self.val_y = self.create_datasets(data=data,
-                                                                                  val_split=val_split)
+        self.train_X, self.train_mesh_X, self.train_y, \
+        self.val_X, self.val_mesh_X, self.val_y = self.create_datasets(data=data,
+                                                                       mesh_dir=mesh_dir,
+                                                                       file_num=file_num,
+                                                                       val_split=val_split)
 
     # Create training/validation/testing datasets from an array of simulations
     def create_datasets(self,
                         data,
+                        mesh_dir,
+                        file_num,
                         val_split=cfg.NN_VALIDATION_SPLIT):
         # Readability
         x_len_samples = data.shape[-3]
@@ -279,14 +310,17 @@ class AcousticNet:
 
         # Loop through all solutions in dataset
         steps_to_predict = t_len_samples - t_lookback
-        a = np.zeros(
-            [num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback])
+        a = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback])
+        a_mesh = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
         u = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
         for i, fdtd_sol in enumerate(data):
             # Loop through each solution and create training data for each time slice
             for t in range(steps_to_predict):
                 # Split data tensor and add to buffers (a, u)
+                mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
+                                      f"{num_solutions * file_num + i}.mesh")
                 a[i, t] = fdtd_sol[:, :, t:t_lookback + t]
+                a_mesh[i, t] = np.expand_dims(mesh, axis=-1)
                 u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
 
         # Split datasets
@@ -294,16 +328,18 @@ class AcousticNet:
         train_amt = num_solutions - val_amt
         assert val_amt + train_amt == num_solutions
         train_X = a[:train_amt]
+        train_mesh_X = a_mesh[:train_amt]
         train_y = u[:train_amt]
         if val_amt > 0:
             val_X = a[train_amt:train_amt + val_amt]
+            val_mesh_X = a_mesh[train_amt:train_amt + val_amt]
             val_y = u[train_amt:train_amt + val_amt]
         else:
-            val_X, val_y = None, None
+            val_X, val_mesh_X, val_y = None, None, None
 
         # Return split datasets
-        return train_X, train_y, \
-               val_X, val_y
+        return train_X, train_mesh_X, train_y, \
+               val_X, val_mesh_X, val_y
 
     # Saves prediction data
     def save_data(self,
@@ -324,7 +360,6 @@ class AcousticNet:
         shape = np.shape(data)
         new_shape = (shape[0] * shape[1],) + shape[2:]
         data_reshaped = np.reshape(data, new_shape)
-
         return data_reshaped
 
     # Get predictions for a block of simulation data
@@ -332,53 +367,54 @@ class AcousticNet:
     # TODO: evaluate against test_Y if not none
     def get_predictions(self,
                         data,
+                        mesh_dir,
+                        file_num,
                         file_name_out=None,
                         batch_size=cfg.NN_BATCH_SIZE,
                         big_batch_size=cfg.NN_BIG_BATCH_SIZE):
         print(f"Obtaining predictions...")
 
-        # Create test X and y datasets
-        test_X, test_y, _, _, = self.create_datasets(data=data,
-                                                     val_split=0)
+        # Readability
+        x_len_samples = data.shape[-3]
+        y_len_samples = data.shape[-2]
+        t_len_samples = data.shape[-1]
+        num_solutions = data.shape[0]
+        t_lookback = self.metadata["t_lookback"]
+        steps_to_predict = t_len_samples - t_lookback
 
-        # Prepare test_X data
-        num_simulations = np.shape(test_X)[0]
-        test_X = self.prepare_dataset_for_model(test_X)
+        pred_data = np.zeros_like(data)
+        if np.shape(data)[-1] > t_lookback:
+            data = data[..., :t_lookback]
+        pred_data[..., :t_lookback] = data
 
-        # Predict in big batches
-        num_big_batches = int(np.ceil(np.shape(test_X)[0] / big_batch_size))
-        shape = np.shape(test_X)[:-1]
-        raw = np.zeros(shape)
-        t0 = datetime.now()
-        for big_batch in range(num_big_batches):
-            print(f"Predicting big batch {big_batch + 1}/{num_big_batches}...\n")
+        a = np.zeros([num_solutions, x_len_samples, y_len_samples, t_lookback])
+        a_mesh = np.zeros([num_solutions, x_len_samples, y_len_samples, 1])
 
-            # Get prediction, drop extra dimension, store in buffer
-            end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
-            pred = self.model.predict(test_X[big_batch * big_batch_size:end], batch_size=batch_size)
-            raw[big_batch * big_batch_size:end] = np.squeeze(pred, axis=-1)
+        for i, fdtd_sol in enumerate(data):
+            mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
+                                  f"{num_solutions * file_num + i}.mesh")
+            a[i] = fdtd_sol[..., :t_lookback]
+            a_mesh[i] = np.expand_dims(mesh, axis=-1)
 
-        # Transpose and reshape full buffer to an array of individual solutions
-        t1 = datetime.now() - t0
-        t1_ms = round(t1.total_seconds() * 1000, 2)
-        raw_shape = np.shape(raw)
-        new_shape = (num_simulations, int(raw_shape[0] / num_simulations),) + raw_shape[1:]
-        data = np.transpose(np.reshape(raw, new_shape), (0, 2, 3, 1))
-        print(f"Predictions obtained. Took {t1_ms}ms "
-              f"(average {round(t1_ms / num_simulations, 2)}ms per solution).\n")  # In MS
+        for step in range(steps_to_predict):
+            pred = np.squeeze(self.model.predict([a, a_mesh], batch_size=batch_size), axis=-1)
+            pred_data[..., step + t_lookback] = pred
+            a[..., :-1] = a[..., 1:t_lookback]
+            a[..., -1] = pred
 
         # Save data
         if file_name_out is not None:
-            self.save_data(data,
+            self.save_data(pred_data,
                            file_name_out=file_name_out)
 
         # Return predicted data
-        return data
+        return pred_data
 
 
 # Fourier neural operator layer
 class FourierLayer(tf.keras.layers.Layer):
     def __init__(self,
+                 fft_type,
                  dtype,
                  in_width=cfg.NN_HL_WIDTH,
                  out_width=cfg.NN_HL_WIDTH,
@@ -386,6 +422,7 @@ class FourierLayer(tf.keras.layers.Layer):
                  **kwargs):
         super(FourierLayer, self).__init__()
         self.dtype_ = dtype
+        self.fft_type = fft_type
         self.in_width = in_width
         self.out_width = out_width
         self.modes = modes
@@ -413,8 +450,9 @@ class FourierLayer(tf.keras.layers.Layer):
         # Initialize weights and biases
         if self.modes > 0:
             wb_shape = [self.modes,
-                        self.modes,
                         self.modes]
+            if self.fft_type == "3d":
+                wb_shape.append(self.modes)
 
             self.w_tl = init_weights(wb_shape)
             self.w_tr = init_weights(wb_shape)
@@ -429,7 +467,10 @@ class FourierLayer(tf.keras.layers.Layer):
             x_shape = input_shape[1:].as_list()
             x = tf.complex(tf.zeros(x_shape),
                            tf.zeros(x_shape))
-            x_ft = tf.signal.fft3d(x)
+            if self.fft_type == "2d":
+                x_ft = tf.signal.fft2d(x)
+            else:
+                x_ft = tf.signal.fft3d(x)
             wb_shape = tf.shape(x_ft)
 
             self.w = init_weights(wb_shape)
@@ -444,15 +485,24 @@ class FourierLayer(tf.keras.layers.Layer):
         # Fourier transform on inputs
         # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
         # Use fft3d instead for now and just ignore the imaginary part
-        x = tf.complex(inputs, inputs)
+        # Zero pad beginning & end of signal to account for FFT periodicity
+        pad_sz = 4
+        padded_inputs = tf.pad(inputs, [[0, 0], [pad_sz, pad_sz], [pad_sz, pad_sz], [pad_sz, pad_sz]])
+        x = tf.complex(padded_inputs, padded_inputs)
         x_ft = tf.math.real(tf.signal.fft3d(x))
 
         # Drop Fourier modes as a regularization measure
         if self.modes > 0:
-            m_tl = x_ft[:, :self.modes, :self.modes, :self.modes]
-            m_tr = x_ft[:, -self.modes:, :self.modes, :self.modes]
-            m_bl = x_ft[:, :self.modes, -self.modes:, :self.modes]
-            m_br = x_ft[:, -self.modes:, -self.modes:, :self.modes]
+            if self.fft_type == "2d":
+                m_tl = x_ft[:, :self.modes, :self.modes]
+                m_tr = x_ft[:, -self.modes:, :self.modes]
+                m_bl = x_ft[:, :self.modes, -self.modes:]
+                m_br = x_ft[:, -self.modes:, -self.modes:]
+            else:
+                m_tl = x_ft[:, :self.modes, :self.modes, :self.modes]
+                m_tr = x_ft[:, -self.modes:, :self.modes, :self.modes]
+                m_bl = x_ft[:, :self.modes, -self.modes:, :self.modes]
+                m_br = x_ft[:, -self.modes:, -self.modes:, :self.modes]
 
             # Multiply Fourier modes with weight matrices and add biases
             xwb_tl = tf.add(tf.multiply(m_tl, self.w_tl), self.b_tl)
@@ -470,27 +520,89 @@ class FourierLayer(tf.keras.layers.Layer):
             in_shape = tf.shape(inputs)
             paddings = [[0, 0],  # Batch
                         [0, in_shape[1] - xwb_shape[1]],  # X
-                        [0, in_shape[2] - xwb_shape[2]],  # Y
-                        [0, self.out_width - xwb_shape[3]]]  # T
-            xwb = tf.pad(xwb, paddings,
-                         "CONSTANT",
-                         constant_values=0)
+                        [0, in_shape[2] - xwb_shape[2]]]  # Y
+            if self.fft_type == "3d":
+                paddings.append([0, self.out_width - xwb_shape[3]])  # T
+            xwb = tf.pad(xwb, paddings)
 
         # Otherwise handle the signal normally
         else:
-            xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
+            xwb = tf.add(tf.multiply(x_ft[:, pad_sz:-pad_sz, pad_sz:-pad_sz, pad_sz:-pad_sz], self.w), self.b)
 
         # Inverse FFT, take real part and return
         # See earlier comment on rfft3d to explain this weirdness
-        x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
-        return tf.math.real(x_r)
+        if self.fft_type == "2d":
+            x_r = tf.signal.ifft2d(tf.complex(xwb, xwb))
+        else:
+            x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
+        output = tf.math.real(x_r)
+        return output#[:, pad_sz:-pad_sz, pad_sz:-pad_sz, pad_sz:-pad_sz]
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
         config = super().get_config().copy()
         config.update({
-            'in_width': self.in_width,
-            'out_width': self.out_width,
-            'modes': self.modes
+            "fft_type": self.fft_type,
+            "in_width": self.in_width,
+            "out_width": self.out_width,
+            "modes": self.modes
         })
         return config
+
+
+# Append gamma map to solution
+class ConcatAbsorption(tf.keras.layers.Layer):
+    def __init__(self,
+                 dtype,
+                 **kwargs):
+        self.dtype_ = dtype
+        super(ConcatAbsorption, self).__init__()
+
+    def call(self, inputs):
+        # Readability
+        solution = inputs[0]
+        mesh = inputs[1]
+        mesh_shape = tf.shape(mesh)
+        n_x, n_y = mesh_shape[1], mesh_shape[2]
+
+        # Create gamma and interior masks
+        in_mask = tf.cast(tf.math.greater(mesh, 0), self.dtype_)
+        gam_mask = tf.identity(mesh)
+        gam_mask *= in_mask
+        in_mask = tf.ones_like(in_mask) - in_mask
+
+        # Create K map (interior neighbors)
+        k_map = in_mask[:, 2:n_x, 1:n_y - 1] + \
+                in_mask[:, 0:n_x - 2, 1:n_y - 1] + \
+                in_mask[:, 1:n_x - 1, 2:n_y] + \
+                in_mask[:, 1:n_x - 1, 0:n_y - 2]
+        k_map = tf.pad(k_map, [[0, 0], [1, 1], [1, 1], [0, 0]], "CONSTANT")
+        k_map = k_map * in_mask
+
+        # Create gamma map (absorption)
+        g_map = gam_mask[:, 2:n_x, 1:n_y - 1] + \
+                gam_mask[:, 0:n_x - 2, 1:n_y - 1] + \
+                gam_mask[:, 1:n_x - 1, 2:n_y] + \
+                gam_mask[:, 1:n_x - 1, 0:n_y - 2]
+        g_map = tf.pad(g_map, [[0, 0], [1, 1], [1, 1], [0, 0]], "CONSTANT")
+        g_map = g_map / (tf.cast(tf.fill(tf.shape(g_map), 4), dtype=self.dtype_) - k_map)
+        g_map = tf.where(tf.math.is_nan(g_map), tf.constant(-1, dtype=self.dtype_), g_map)
+
+        # Concat gamma map with solution and return
+        return tf.concat([solution, g_map], axis=-1)
+
+
+# Transform network output
+class ConstrainOutput(tf.keras.layers.Layer):
+    def __init__(self,
+                 dtype,
+                 **kwargs):
+        self.dtype_ = dtype
+        super(ConstrainOutput, self).__init__()
+
+    def call(self, inputs):
+        solution = inputs[0]
+        mesh = inputs[1]
+        in_mask = tf.cast(tf.math.less(mesh, 0),
+                          dtype=self.dtype_)
+        return solution * in_mask

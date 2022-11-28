@@ -1,35 +1,63 @@
 import util
+import config as cfg
 from project import ProjectManager
 import numpy as np
 
 RENDER_ERROR = True
-RENDER_ANIMS = False
+RENDER_ANIMS = True
 RENDER_FDTD_ANIMS = False
 RENDER_IRS = False
+
+CREATE_MESHES = False
+CREATE_MESHES_TEST = False
 RUN_FDTD = False
 RUN_FDTD_TEST = False
-LOAD_MODEL = True
-GET_PREDICTIONS = False
+
+LOAD_MODEL = False
+GET_PREDICTIONS = True
 FIT_ADAM = True
 FIT_L_BFGS_B = False
 
 # Init project
-PROJ_NAME = "wide"
-SIM_NAME = "29x15"
+PROJ_NAME = "square_0.1s"
+FDTD_NAME = "no_absorb"
+SIM_NAME = "no_absorb"
 manager = ProjectManager(proj_name=PROJ_NAME)
+
+# Create meshes
+if CREATE_MESHES:
+    bc_coeffs = manager.fdtd.sample_bc_coeffs(num_meshes=cfg.FDTD_NUM_MESHES_TRAIN)
+    dx, dt = manager.fdtd.get_dx_dt()
+    manager.fdtd.create_meshes(file_name_out=FDTD_NAME,
+                               dim_lengths_samples=manager.fdtd.get_grid_dims(dx=dx, dt=dt),
+                               bc_coeffs=bc_coeffs)
+
+# Create test meshes
+if CREATE_MESHES_TEST:
+    bc_coeffs = manager.fdtd.sample_bc_coeffs(num_meshes=cfg.FDTD_NUM_MESHES_TEST)
+    dx, dt = manager.fdtd.get_dx_dt()
+    manager.fdtd.create_meshes(file_name_out=f"{FDTD_NAME}_test",
+                               dim_lengths_samples=manager.fdtd.get_grid_dims(dx=dx, dt=dt),
+                               bc_coeffs=bc_coeffs)
 
 # Run FDTD
 if RUN_FDTD:
-    manager.fdtd.run(file_name_out=SIM_NAME)
+    ic_points = manager.fdtd.sample_ic_points(mesh_dir=FDTD_NAME,
+                                              num_sims_per_mesh=1)
+    manager.fdtd.run(file_name_out=SIM_NAME,
+                     mesh_dir=FDTD_NAME,
+                     ic_points=ic_points)
 
 # Create test data
 if RUN_FDTD_TEST:
+    ic_points = manager.fdtd.sample_ic_points(mesh_dir=f"{FDTD_NAME}_test",
+                                              num_sims_per_mesh=1)
     manager.fdtd.run(file_name_out=f"{SIM_NAME}_test",
-                     num_meshes=10,
-                     round_bc_coeffs=False)
+                     mesh_dir=f"{FDTD_NAME}_test",
+                     ic_points=ic_points)
 
 # Load model or fit a new model to data
-fdtd_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{SIM_NAME}/meta.json")
+fdtd_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}/meta.json")
 if LOAD_MODEL is not None:
     if LOAD_MODEL:
         manager.nn.load_model(SIM_NAME)
@@ -42,26 +70,30 @@ if LOAD_MODEL is not None:
 
         # Fit and save
         if FIT_ADAM:
-            manager.nn.fit_model(train_data_dir=SIM_NAME,
+            manager.nn.fit_model(data_dir=FDTD_NAME,
+                                 mesh_dir=FDTD_NAME,
                                  optimizer_mode="adam",
                                  num_files=fdtd_meta["num_files"])
         if FIT_L_BFGS_B:
-            manager.nn.fit_model(train_data_dir=SIM_NAME,
+            manager.nn.fit_model(data_dir=FDTD_NAME,
+                                 mesh_dir=FDTD_NAME,
                                  optimizer_mode="l-bfgs-b",
                                  num_files=fdtd_meta["num_files"])
         manager.nn.save_model(model_name_out=SIM_NAME)
 
 # Loop through test data files
-fdtd_test_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{SIM_NAME}_test/meta.json")
+fdtd_test_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/meta.json")
 num_files = fdtd_test_meta["num_files"]
 errors_mae, titles_mae, file_names_out_mae = [], [], []
 errors_rmse, titles_rmse, file_names_out_rmse = [], [], []
 for i in range(num_files):
     # Get predictions and save data
-    test_data = util.load_data(f"{manager.get_proj_path()}fdtd/{SIM_NAME}_test/{i}.pkl")
+    test_data = util.load_data(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/{i}.pkl")
 
     if GET_PREDICTIONS:
         pred_data = manager.nn.get_predictions(data=test_data,
+                                               mesh_dir=FDTD_NAME,
+                                               file_num=i,
                                                file_name_out=f"{SIM_NAME}_{i}")
     else:
         pred_data = util.load_data(f"{manager.get_proj_path()}pred/{SIM_NAME}_{i}.pkl")
@@ -71,16 +103,16 @@ for i in range(num_files):
     for test_index in range(num_simulations):
         total_index = i * num_simulations + test_index
         ic_pos = np.around(fdtd_test_meta[str(total_index)]["impulse_xy"], 3)
-        mesh_id = fdtd_test_meta[str(total_index)]["mesh_id"]
-        mesh = util.load_data(f"{manager.get_proj_path()}fdtd/{SIM_NAME}_test/mesh/{mesh_id}.pkl")
+        mesh_id = fdtd_test_meta[str(total_index)]["i"]
+        mesh = util.load_data(f"{manager.get_proj_path()}mesh/{FDTD_NAME}_test/{mesh_id}.mesh")
 
         if RENDER_ERROR:
             errors_mae.append(util.calc_error_heatmap(true_data=test_data[test_index],
                                                       pred_data=pred_data[test_index],
-                                                      error_mode="mae"))
-            titles_mae.append("MAE$(Data_{true}, Data_{prediction})$\n"
+                                                      error_mode="mre"))
+            titles_mae.append("MRE$(Data_{true}, Data_{prediction})$\n"
                               f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$")
-            file_names_out_mae.append(f"{SIM_NAME}_mae_"
+            file_names_out_mae.append(f"{SIM_NAME}_mre_"
                                       f"{total_index}")
 
             errors_rmse.append(util.calc_error_heatmap(true_data=test_data[test_index],
