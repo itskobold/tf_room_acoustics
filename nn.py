@@ -15,12 +15,6 @@ class AcousticNet:
 
         # Init variables
         self.model = None
-        self.train_X = None
-        self.train_mesh_X = None
-        self.train_y = None
-        self.val_X = None
-        self.val_mesh_X = None
-        self.val_y = None
         self.metadata = {}
 
         # Handle backend stuff
@@ -63,6 +57,8 @@ class AcousticNet:
     # Create a new Tensorflow model.
     def init_model(self,
                    network_shape,
+                   fdtd_dir,
+                   num_blocks,
                    num_hidden_layers=cfg.FNO_HIDDEN_LAYERS,
                    fno_width=cfg.FNO_WIDTH,
                    dense_width=cfg.NN_HL_WIDTH,
@@ -82,14 +78,26 @@ class AcousticNet:
                   f"t_lookback = {self.metadata['t_lookback']}, "
                   f"network_shape (X, Y) = {self.metadata['network_shape'][:2]}.")
 
+        # Get dataset mean & variance
+        means, vars = [], []
+        for i in range(num_blocks):
+            data = util.load_data(f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/input/X/{i}.pkl")
+            means.append(np.mean(data))
+            vars.append(np.std(data))
+        mean = np.mean(means)
+        var = np.mean(vars)
+
         # Create layer for mesh input
         mesh_input = tf.keras.Input(self.metadata["mesh_input_shape"])
 
         # Create solution input & list for layers
         layers = [tf.keras.Input(self.metadata["network_shape"])]
+        layers.append(tf.keras.layers.Normalization(axis=None,
+                                                    mean=mean,
+                                                    variance=var)(layers[-1]))
 
         # Concatenate absorption map with solution layers
-        layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
+        #layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
 
         # Append up projection layer (linear, no activation)
         layers.append(tf.keras.layers.Dense(fno_width, activation=None)(layers[-1]))
@@ -147,6 +155,9 @@ class AcousticNet:
         t0 = datetime.now()
         for pass_num in range(num_passes):
             print(f"Beginning training pass {pass_num + 1}/{num_passes}.")
+            loss_fn = tf.keras.losses.MeanSquaredError()
+            train_metric = tf.keras.metrics.MeanSquaredError()
+            val_metric = tf.keras.metrics.MeanSquaredError()
 
             # Shuffle order of blocks
             block_ids = np.arange(num_blocks)
@@ -169,10 +180,9 @@ class AcousticNet:
                 train_X = X_data[:train_amt]
                 train_mesh_X_ids = mesh_X_ids[:train_amt]
                 train_y = y_data[:train_amt]
-                num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
 
                 # Shuffle datasets
-                #train_X, train_mesh_X_ids, train_y, = shuffle(train_X, train_mesh_X_ids, train_y)
+                train_X, train_mesh_X_ids, train_y, = shuffle(train_X, train_mesh_X_ids, train_y)
 
                 # Load meshes
                 train_mesh_X = np.zeros([train_mesh_X_ids.shape[0],
@@ -181,25 +191,6 @@ class AcousticNet:
                                          1])
                 for mesh_id in range(train_mesh_X_ids.shape[0]):
                     train_mesh_X[mesh_id] = np.expand_dims(util.load_data(f"{mesh_path}{mesh_id}.mesh"), axis=-1)
-
-                # Create validation data
-                if val_amt > 0:
-                    val_X = X_data[train_amt:train_amt + val_amt]
-                    val_mesh_X_ids = mesh_X_ids[train_amt:train_amt + val_amt]
-                    val_y = y_data[train_amt:train_amt + val_amt]
-
-                    # Load meshes
-                    val_mesh_X = np.zeros([val_mesh_X_ids.shape[0],
-                                           meta["x_len_samples"],
-                                           meta["y_len_samples"],
-                                           1])
-                    for mesh_id in range(val_mesh_X_ids.shape[0]):
-                        val_mesh_X[mesh_id] = util.load_data(f"{mesh_path}{mesh_id}.mesh")
-
-                    # Get validation big batch size
-                    big_batch_size_val = int(np.floor(val_X.shape[0] / num_big_batches))
-                else:
-                    val_data = None
 
                 # Loop through big batches
                 num_big_batches = int(np.ceil(train_X.shape[0] / big_batch_size))
@@ -210,21 +201,54 @@ class AcousticNet:
                     train_dataset = tf.data.Dataset.from_tensor_slices((train_X, train_mesh_X, train_y)) \
                         .batch(batch_size)
 
+                    # Create validation data
+                    if val_amt > 0:
+                        val_X = X_data[train_amt:train_amt + val_amt]
+                        val_mesh_X_ids = mesh_X_ids[train_amt:train_amt + val_amt]
+                        val_y = y_data[train_amt:train_amt + val_amt]
+
+                        # Load meshes
+                        val_mesh_X = np.zeros([val_mesh_X_ids.shape[0],
+                                               meta["dim_lengths_samples"][0],
+                                               meta["dim_lengths_samples"][1],
+                                               1])
+                        for mesh_id in range(val_mesh_X_ids.shape[0]):
+                            val_mesh_X[mesh_id] = np.expand_dims(util.load_data(f"{mesh_path}{mesh_id}.mesh"), axis=-1)
+
+                        # Create data tensor
+                        val_dataset = tf.data.Dataset.from_tensor_slices((val_X, val_mesh_X, val_y)) \
+                            .batch(batch_size)
+                    else:
+                        val_dataset = None
+
                     # Train over number of iterations
                     for i in range(iterations):
                         # Train each batch
                         for step, (train_batch_X, train_mesh_batch_X, train_batch_y) in enumerate(train_dataset):
                             with tf.GradientTape() as tape:
                                 logits = self.model([train_batch_X, train_mesh_batch_X], training=True)
-                                losses = tf.losses.mean_squared_error(train_batch_y, logits)
+                                losses = loss_fn(train_batch_y, logits)
                             grads = tape.gradient(losses, self.model.trainable_weights)
-                            optimizer = tf.keras.optimizers.Adam(
-                                learning_rate=self.inverse_time_decay(initial_epoch + i,
-                                                                      learning_rate=learning_rate,
-                                                                      decay_steps=decay_steps,
-                                                                      decay_rate=decay_rate))
+                            lr = self.inverse_time_decay(initial_epoch + i,
+                                                         learning_rate=learning_rate,
+                                                         decay_steps=decay_steps,
+                                                         decay_rate=decay_rate)
+                            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
                             optimizer.apply_gradients(zip(grads, self.model.trainable_weights))
-                        print(f"It: {initial_epoch + i}, Loss = {np.sum(losses.numpy()):.8e}")
+                            train_metric.update_state(train_batch_y, logits)
+
+                        # Evaluate validation dataset
+                        if val_dataset is not None:
+                            for val_batch_X, val_mesh_batch_X, val_batch_y in val_dataset:
+                                val_logits = self.model([val_batch_X, val_mesh_batch_X], training=False)
+                                val_metric.update_state(val_batch_y, val_logits)
+                            str_app = f", Val = {val_metric.result():.8e}"
+                            val_metric.reset_states()
+                        else:
+                            str_app = ""
+
+                        print(f"It: {initial_epoch + i}, Loss = {train_metric.result():.8e}{str_app}")
+                        train_metric.reset_states()
 
                     # Update initial epoch and clear train dataset tensor
                     initial_epoch += iterations

@@ -18,9 +18,9 @@ FDTD_ROUND_BC_COEFFS = True  # Round BC absorption coefficients to 2 decimal pla
 NN_HL_WIDTH = 128  # Width of final up projection dense layer
 NN_BIG_BATCH_SIZE = 256  # Size of chunks passed to network from blocks
 NN_BATCH_SIZE = 32  # Size of batches processed by the network
-NN_ITERATIONS = 5  # Number of iterations per big batch
-NN_NUM_PASSES = 100  # Number of passes through the training dataset
-NN_VALIDATION_SPLIT = 0  # How much of the dataset to use for validation during training (between 0 and 1)
+NN_ITERATIONS = 2500  # Number of iterations per big batch
+NN_NUM_PASSES = 1  # Number of passes through the training dataset
+NN_VALIDATION_SPLIT = 0.01  # How much of the dataset to use for validation during training (between 0 and 1)
 NN_PAD_DATA = False  # Pad data with zeros if True or drop excess data from datasets if False
 NN_SHUFFLE_PASSES = 100  # Number of times datasets should be shuffled together during data preparation
 
@@ -33,8 +33,8 @@ FNO_MODES = 8  # Number of modes to keep from FFT.  Set to -1 to drop no modes
 
 # ADAM optimizer options
 ADAM_LEARNING_RATE = 0.001
-ADAM_LR_DECAY_STEPS = 1000
-ADAM_LR_DECAY_RATE = 0.5
+ADAM_LR_DECAY_STEPS = 100
+ADAM_LR_DECAY_RATE = 0.9
 
 # Rendering
 ANIM_FPS = 30  # Frame rate of rendered animations

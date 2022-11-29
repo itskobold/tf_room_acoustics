@@ -72,7 +72,9 @@ if LOAD_MODEL is not None:
     else:
         # Init model
         network_shape = util.network_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
-        manager.nn.init_model(network_shape=network_shape)
+        manager.nn.init_model(network_shape=network_shape,
+                              fdtd_dir=FDTD_NAME,
+                              num_blocks=fdtd_meta["num_files"])
 
         # Fit and save
         manager.nn.fit_model(fdtd_dir=FDTD_NAME,
