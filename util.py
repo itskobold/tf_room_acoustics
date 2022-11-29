@@ -3,6 +3,7 @@ import config as cfg
 import json
 import pickle
 from pathlib import Path
+from sklearn.utils import shuffle
 
 # Constants
 SIDE_LEFT = 0
@@ -39,6 +40,124 @@ class Util:
         y_pos = int((y_len_samples - 1) * xy_pos_relative[1])
         return x_pos, y_pos
 
+    # Loop through FDTD data, output unshuffled data prepared for neural network input
+    def create_raw_input_data(self,
+                              fdtd_dir,
+                              t_lookback=cfg.FNO_T_LOOKBACK,
+                              pad_data=cfg.NN_PAD_DATA):
+        print(f"Creating raw input data for FDTD simulation {fdtd_dir}...")
+        fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
+        input_path = f"{fdtd_path}input/raw/"
+        X_path = f"{input_path}X/"
+        mesh_X_path = f"{input_path}mesh_X/"
+        y_path = f"{input_path}y/"
+        meta = load_json(f"{fdtd_path}{fdtd_dir}/meta.json")
+        num_blocks = meta["num_files"]
+        sims_per_block = meta["sims_per_file"]
+
+        # Loop through all blocks created by FDTD simulation
+        for block_id in range(num_blocks):
+            # Load block
+            block = load_data(f"{fdtd_path}{block_id}.pkl")
+
+            # Pad/trim data
+            if pad_data:
+                padding_amt = t_lookback - (block.shape[-1] % t_lookback)
+                block = np.pad(block, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
+            else:
+                block = block[..., :-(block.shape[-1] % t_lookback)]
+
+            # Readability
+            x_len_samples = block.shape[-3]
+            y_len_samples = block.shape[-2]
+            t_len_samples = block.shape[-1]
+
+            # Create data buffers
+            steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
+            a = np.zeros([sims_per_block * steps_to_predict, x_len_samples, y_len_samples, t_lookback])
+            a_mesh = np.zeros([sims_per_block * steps_to_predict, 1])
+            u = np.zeros([sims_per_block * steps_to_predict, x_len_samples, y_len_samples, t_lookback])
+
+            # Loop through all solutions in dataset
+            for i, fdtd_data in enumerate(block):
+                # Split data into chunks and add to buffers (a, a_mesh, u)
+                for step in range(steps_to_predict):
+                    t = step * t_lookback
+                    step_id = i * steps_to_predict + step
+                    a[step_id] = fdtd_data[..., t:t + t_lookback]
+                    a_mesh[step_id] = meta[f"{block_id * sims_per_block + i}"]["i"]
+                    u[step_id] = fdtd_data[..., t + t_lookback:t + t_lookback + t_lookback]
+
+            # Save data
+            create_folder(X_path)
+            create_folder(mesh_X_path)
+            create_folder(y_path)
+            save_data(f"{X_path}{block_id}.pkl", a)
+            save_data(f"{mesh_X_path}{block_id}.pkl", a_mesh)
+            save_data(f"{y_path}{block_id}.pkl", u)
+            print(f"Raw data created for block ID {block_id}.")
+        print("Finished producing raw data from FDTD simulations.\n")
+
+    # Process raw input data by shuffling it together
+    def prepare_raw_data_for_network(self,
+                                     fdtd_dir,
+                                     shuffle_passes=cfg.NN_SHUFFLE_PASSES):
+        print("Shuffling raw datasets together...")
+
+        # Load FDTD metadata
+        meta = load_json(f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/meta.json")
+        num_blocks = meta["num_files"]
+
+        # Shuffle through entire dataset multiple times
+        for i in range(shuffle_passes):
+            print(f"Shuffling raw data blocks: {i + 1}/{shuffle_passes}...")
+
+            # Handle directories
+            fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
+            input_path = f"{fdtd_path}input/"
+            raw_path = f"{input_path}raw/"
+            X_path = f"{input_path}X/"
+            mesh_X_path = f"{input_path}mesh_X/"
+            y_path = f"{input_path}y/"
+            create_folder(X_path)
+            create_folder(mesh_X_path)
+            create_folder(y_path)
+
+            # Shuffle order of blocks
+            block_ids = np.arange(num_blocks)
+            block_ids = shuffle(block_ids)
+
+            # Loop through all blocks
+            for j in range(num_blocks - 1):
+                # Get 2 block IDs from shuffled list
+                id_0 = block_ids[j]
+                id_1 = block_ids[j + 1]
+
+                # Load raw X, mesh_X and y data for adjacent blocks from block IDs
+                load_path = raw_path if i == 0 else input_path
+                b0_X = load_data(f"{load_path}X/{id_0}.pkl")
+                b0_mesh_X = load_data(f"{load_path}mesh_X/{id_0}.pkl")
+                b0_y = load_data(f"{load_path}y/{id_0}.pkl")
+                b1_X = load_data(f"{load_path}X/{id_1}.pkl")
+                b1_mesh_X = load_data(f"{load_path}mesh_X/{id_1}.pkl")
+                b1_y = load_data(f"{load_path}y/{id_1}.pkl")
+
+                # Concatenate adjacent block X, mesh_X and y data and shuffle together
+                fb_X = np.concatenate([b0_X, b1_X], axis=0)
+                fb_mesh_X = np.concatenate([b0_mesh_X, b1_mesh_X], axis=0)
+                fb_y = np.concatenate([b0_y, b1_y], axis=0)
+                fb_X, fb_mesh_X, fb_y = shuffle(fb_X, fb_mesh_X, fb_y)
+
+                # Save to input data directory
+                split = b0_X.shape[0]
+                save_data(f"{X_path}{id_0}.pkl", fb_X[split:])
+                save_data(f"{X_path}{id_1}.pkl", fb_X[:split])
+                save_data(f"{mesh_X_path}{id_0}.pkl", fb_mesh_X[split:])
+                save_data(f"{mesh_X_path}{id_1}.pkl", fb_mesh_X[:split])
+                save_data(f"{y_path}{id_0}.pkl", fb_y[split:])
+                save_data(f"{y_path}{id_1}.pkl", fb_y[:split])
+        print("Finished shuffling raw datasets.\n")
+
 
 # Create time string from timedelta object.
 def timedelta_to_str(timedelta):
@@ -47,15 +166,10 @@ def timedelta_to_str(timedelta):
     return f"{hours} hours, {minutes} mins, {seconds} secs"
 
 
-# Get neural network input shape from data shape (X, Y, T).
-def input_shape_from_data_shape(data_shape,
-                                t_lookback=cfg.FNO_T_LOOKBACK):
+# Get neural network shape from data shape (X, Y, T).
+def network_shape_from_data_shape(data_shape,
+                                  t_lookback=cfg.FNO_T_LOOKBACK):
     return data_shape[:2] + [t_lookback]
-
-
-# Get neural network output shape from data shape (X, Y, T).
-def output_shape_from_data_shape(data_shape):
-    return data_shape[:2] + [1]
 
 
 # Mean relative error.

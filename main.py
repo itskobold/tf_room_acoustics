@@ -12,11 +12,11 @@ CREATE_MESHES = False
 CREATE_MESHES_TEST = False
 RUN_FDTD = False
 RUN_FDTD_TEST = False
+CREATE_RAW_INPUT_DATA = False
+PROCESS_RAW_INPUT_DATA = False
 
 LOAD_MODEL = False
 GET_PREDICTIONS = True
-FIT_ADAM = True
-FIT_L_BFGS_B = False
 
 # Init project
 PROJ_NAME = "square_0.1s"
@@ -56,6 +56,14 @@ if RUN_FDTD_TEST:
                      mesh_dir=f"{FDTD_NAME}_test",
                      ic_points=ic_points)
 
+# Create raw input data from FDTD data
+if CREATE_RAW_INPUT_DATA:
+    manager.util.create_raw_input_data(fdtd_dir=FDTD_NAME)
+
+# Shuffle training data for input to network
+if PROCESS_RAW_INPUT_DATA:
+    manager.util.prepare_raw_data_for_network(fdtd_dir=FDTD_NAME)
+
 # Load model or fit a new model to data
 fdtd_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}/meta.json")
 if LOAD_MODEL is not None:
@@ -63,22 +71,13 @@ if LOAD_MODEL is not None:
         manager.nn.load_model(SIM_NAME)
     else:
         # Init model
-        input_shape = util.input_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
-        output_shape = util.output_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
-        manager.nn.init_model(input_shape=input_shape,
-                              output_shape=output_shape)
+        network_shape = util.network_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
+        manager.nn.init_model(network_shape=network_shape)
 
         # Fit and save
-        if FIT_ADAM:
-            manager.nn.fit_model(data_dir=FDTD_NAME,
-                                 mesh_dir=FDTD_NAME,
-                                 optimizer_mode="adam",
-                                 num_files=fdtd_meta["num_files"])
-        if FIT_L_BFGS_B:
-            manager.nn.fit_model(data_dir=FDTD_NAME,
-                                 mesh_dir=FDTD_NAME,
-                                 optimizer_mode="l-bfgs-b",
-                                 num_files=fdtd_meta["num_files"])
+        manager.nn.fit_model(fdtd_dir=FDTD_NAME,
+                             mesh_dir=FDTD_NAME,
+                             num_blocks=20)#fdtd_meta["num_files"])
         manager.nn.save_model(model_name_out=SIM_NAME)
 
 # Loop through test data files

@@ -62,58 +62,57 @@ class AcousticNet:
 
     # Create a new Tensorflow model.
     def init_model(self,
-                   input_shape,
-                   output_shape,
-                   num_hidden_layers=cfg.NN_HIDDEN_LAYERS,
-                   width=cfg.NN_HL_WIDTH,
+                   network_shape,
+                   num_hidden_layers=cfg.FNO_HIDDEN_LAYERS,
+                   fno_width=cfg.FNO_WIDTH,
+                   dense_width=cfg.NN_HL_WIDTH,
                    t_lookback=cfg.FNO_T_LOOKBACK,
                    modes=cfg.FNO_MODES):
         print("Initializing neural network model...")
 
         # Set metadata parameters
-        self.metadata["input_shape"] = input_shape
-        self.metadata["mesh_input_shape"] = input_shape[:2] + [1]
-        self.metadata["output_shape"] = output_shape
+        self.metadata["network_shape"] = network_shape
+        self.metadata["mesh_input_shape"] = network_shape[:2] + [1]
         self.metadata["t_lookback"] = t_lookback
 
         # Print warning if t_lookback is too short to capture first order reflections from boundaries for sure
-        if self.metadata["input_shape"][0] > t_lookback or \
-                self.metadata["input_shape"][1] > t_lookback:
+        if self.metadata["network_shape"][0] > t_lookback or \
+                self.metadata["network_shape"][1] > t_lookback:
             print("\nWARNING: t_lookback might be too short to capture first order reflections from all boundaries! "
                   f"t_lookback = {self.metadata['t_lookback']}, "
-                  f"input_shape (X, Y) = {self.metadata['input_shape'][:2]}.")
+                  f"network_shape (X, Y) = {self.metadata['network_shape'][:2]}.")
 
         # Create layer for mesh input
         mesh_input = tf.keras.Input(self.metadata["mesh_input_shape"])
 
         # Create solution input & list for layers
-        layers = [tf.keras.Input(self.metadata["input_shape"])]
+        layers = [tf.keras.Input(self.metadata["network_shape"])]
 
         # Concatenate absorption map with solution layers
         layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
 
         # Append up projection layer (linear, no activation)
-        layers.append(tf.keras.layers.Dense(width, activation=None)(layers[-1]))
+        layers.append(tf.keras.layers.Dense(fno_width, activation=None)(layers[-1]))
 
         # Append FNO layers
         for i in range(num_hidden_layers):
             last_layer = layers[-1]
             fourier_layer = FourierLayer(dtype=self.manager.metadata["dtype"],
                                          fft_type="3d",
-                                         in_width=width,
-                                         out_width=width,
+                                         in_width=fno_width,
+                                         t_lookback=t_lookback,
                                          modes=modes)(last_layer)
-            conv = tf.keras.layers.Conv2D(filters=width,
+            conv = tf.keras.layers.Conv2D(filters=fno_width,
                                           kernel_size=1)(last_layer)
             layers.append(tf.keras.layers.Add()([fourier_layer, conv]))
             layers.append(tf.keras.layers.Lambda(lambda x: tf.keras.activations.gelu(x))(layers[-1]))
 
         # Append down projection layer (linear, no activation)
-        layers.append(tf.keras.layers.Dense(128,
+        layers.append(tf.keras.layers.Dense(dense_width,
                                             activation=None)(layers[-1]))
 
         # Append output layer
-        layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
+        layers.append(tf.keras.layers.Dense(self.metadata["network_shape"][-1],
                                             activation=None)(layers[-1]))
 
         # Append transformation layer to constrain predictions within boundaries
@@ -126,100 +125,110 @@ class AcousticNet:
 
     # Train from simulation data in a directory split into numbered blocks.
     # Remember to create a model with init_model or load one with load_model before fitting.
-    # Optimizer mode can be "adam" or "l-bfgs-b".
     def fit_model(self,
-                  data_dir,
+                  fdtd_dir,
                   mesh_dir,
-                  num_files,
-                  optimizer_mode=cfg.NN_OPTIMIZER,
+                  num_blocks,
                   iterations=cfg.NN_ITERATIONS,
-                  options=None,
+                  learning_rate=cfg.ADAM_LEARNING_RATE,
+                  decay_steps=cfg.ADAM_LR_DECAY_STEPS,
+                  decay_rate=cfg.ADAM_LR_DECAY_RATE,
+                  val_split=cfg.NN_VALIDATION_SPLIT,
                   batch_size=cfg.NN_BATCH_SIZE,
                   big_batch_size=cfg.NN_BIG_BATCH_SIZE,
                   num_passes=cfg.NN_NUM_PASSES):
-        # Get default options if none specified
-        if options is None:
-            options = self.get_default_options(optimizer_mode)
-
-        # Compile model
-        self.compile_model(options=options,
-                           optimizer_mode=optimizer_mode)
-
         # Loop over numerous passes so entire dataset is passed through relatively evenly
         # as learning rate decays over time.
+        fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
+        mesh_path = f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
+        meta = util.load_json(f"{fdtd_path}meta.json")
+        sims_per_block = meta["sims_per_file"]
         initial_epoch = 0
         t0 = datetime.now()
         for pass_num in range(num_passes):
             print(f"Beginning training pass {pass_num + 1}/{num_passes}.")
 
             # Shuffle order of blocks
-            block_ids = np.arange(num_files)
+            block_ids = np.arange(num_blocks)
             block_ids = shuffle(block_ids)
 
             # Loop through all files to train from
-            for file_num in range(num_files):
+            for file_num in range(num_blocks):
                 block_id = block_ids[file_num]
-                print(f"Training on data block {block_id} ({file_num + 1}/{num_files})...")
+                print(f"Training on block {file_num + 1}/{num_blocks} (ID {block_id})...")
 
-                # Load data from file
-                self.init_data(util.load_data(f"{self.manager.get_proj_path()}fdtd/{data_dir}/{block_id}.pkl"),
-                               mesh_dir=mesh_dir,
-                               file_num=file_num)
+                # Load X, X_mesh and y data from "{fdtd_dir}/input/"
+                X_data = util.load_data(f"{fdtd_path}input/X/{block_id}.pkl")
+                mesh_X_ids = util.load_data(f"{fdtd_path}input/mesh_X/{block_id}.pkl")
+                y_data = util.load_data(f"{fdtd_path}input/y/{block_id}.pkl")
 
-                # Prepare datasets to be passed to model and shuffle data, mixing all simulations together
-                train_X = self.prepare_dataset_for_model(self.train_X)
-                train_mesh_X = self.prepare_dataset_for_model(self.train_mesh_X)
-                train_y = self.prepare_dataset_for_model(self.train_y)
-                train_X, train_mesh_X, train_y, = shuffle(train_X, train_mesh_X, train_y,
-                                                          random_state=self.manager.metadata["seed"])
+                # Split datasets
+                val_amt = int(np.ceil(sims_per_block * val_split))
+                train_amt = sims_per_block - val_amt
+                assert val_amt + train_amt == sims_per_block
+                train_X = X_data[:train_amt]
+                train_mesh_X_ids = mesh_X_ids[:train_amt]
+                train_y = y_data[:train_amt]
                 num_big_batches = int(np.ceil(np.shape(train_X)[0] / big_batch_size))
 
-                # Do the same for validation data (if any exists)
-                if self.val_X is not None and \
-                        self.val_mesh_X is not None and \
-                        self.val_y is not None:
-                    use_val = True
-                    val_X = self.prepare_dataset_for_model(self.val_X)
-                    val_mesh_X = self.prepare_dataset_for_model(self.val_mesh_X)
-                    val_y = self.prepare_dataset_for_model(self.val_y)
-                    val_X, val_y = shuffle(val_X, val_y,
-                                           random_state=self.manager.metadata["seed"])
-                    big_batch_size_val = int(np.floor(np.shape(val_X)[0] / num_big_batches))
+                # Shuffle datasets
+                #train_X, train_mesh_X_ids, train_y, = shuffle(train_X, train_mesh_X_ids, train_y)
+
+                # Load meshes
+                train_mesh_X = np.zeros([train_mesh_X_ids.shape[0],
+                                         meta["dim_lengths_samples"][0],
+                                         meta["dim_lengths_samples"][1],
+                                         1])
+                for mesh_id in range(train_mesh_X_ids.shape[0]):
+                    train_mesh_X[mesh_id] = np.expand_dims(util.load_data(f"{mesh_path}{mesh_id}.mesh"), axis=-1)
+
+                # Create validation data
+                if val_amt > 0:
+                    val_X = X_data[train_amt:train_amt + val_amt]
+                    val_mesh_X_ids = mesh_X_ids[train_amt:train_amt + val_amt]
+                    val_y = y_data[train_amt:train_amt + val_amt]
+
+                    # Load meshes
+                    val_mesh_X = np.zeros([val_mesh_X_ids.shape[0],
+                                           meta["x_len_samples"],
+                                           meta["y_len_samples"],
+                                           1])
+                    for mesh_id in range(val_mesh_X_ids.shape[0]):
+                        val_mesh_X[mesh_id] = util.load_data(f"{mesh_path}{mesh_id}.mesh")
+
+                    # Get validation big batch size
+                    big_batch_size_val = int(np.floor(val_X.shape[0] / num_big_batches))
                 else:
-                    use_val, val_X, val_mesh_X, val_y, big_batch_size_val = False, None, None, None, None
+                    val_data = None
 
                 # Loop through big batches
+                num_big_batches = int(np.ceil(train_X.shape[0] / big_batch_size))
                 for big_batch in range(num_big_batches):
                     print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
-                    end = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size
 
-                    # Prepare validation data
-                    if use_val:
-                        end_val = -1 if big_batch == num_big_batches - 1 else (big_batch + 1) * big_batch_size_val
-                        val_data = ([val_X[big_batch * big_batch_size_val:end_val],
-                                     val_mesh_X[big_batch * big_batch_size_val:end_val]],
-                                    val_y[big_batch * big_batch_size_val:end_val])
-                    else:
-                        val_data = None
+                    # Create train dataset tensor
+                    train_dataset = tf.data.Dataset.from_tensor_slices((train_X, train_mesh_X, train_y)) \
+                        .batch(batch_size)
 
-                    if optimizer_mode == "adam":
-                        self.model.fit([train_X[big_batch * big_batch_size:end],
-                                        train_mesh_X[big_batch * big_batch_size:end]],
-                                       train_y[big_batch * big_batch_size:end],
-                                       batch_size=batch_size,
-                                       epochs=iterations + initial_epoch,
-                                       initial_epoch=initial_epoch,
-                                       validation_data=val_data)
-                        initial_epoch += iterations
-                    else:
-                        self.model.fit([train_X[big_batch * big_batch_size:end],
-                                        train_mesh_X[big_batch * big_batch_size:end]],
-                                       train_y[big_batch * big_batch_size:end],
-                                       batch_size=batch_size,
-                                       epochs=iterations,
-                                       validation_data=val_data,
-                                       method=optimizer_mode,
-                                       options=options)
+                    # Train over number of iterations
+                    for i in range(iterations):
+                        # Train each batch
+                        for step, (train_batch_X, train_mesh_batch_X, train_batch_y) in enumerate(train_dataset):
+                            with tf.GradientTape() as tape:
+                                logits = self.model([train_batch_X, train_mesh_batch_X], training=True)
+                                losses = tf.losses.mean_squared_error(train_batch_y, logits)
+                            grads = tape.gradient(losses, self.model.trainable_weights)
+                            optimizer = tf.keras.optimizers.Adam(
+                                learning_rate=self.inverse_time_decay(initial_epoch + i,
+                                                                      learning_rate=learning_rate,
+                                                                      decay_steps=decay_steps,
+                                                                      decay_rate=decay_rate))
+                            optimizer.apply_gradients(zip(grads, self.model.trainable_weights))
+                        print(f"It: {initial_epoch + i}, Loss = {np.sum(losses.numpy()):.8e}")
+
+                    # Update initial epoch and clear train dataset tensor
+                    initial_epoch += iterations
+                    del train_dataset
 
         # Add training time to metadata
         training_time = datetime.now() - t0
@@ -228,118 +237,6 @@ class AcousticNet:
         # All done
         print(f"Training complete. "
               f"Took {util.timedelta_to_str(training_time)}.\n")
-
-    # Compile model with optimizer.  Options are only needed for ADAM optimizer.
-    # This is handled as part of fit_model, shouldn't need to call separately ever.
-    def compile_model(self,
-                      options,
-                      optimizer_mode=cfg.NN_OPTIMIZER):
-        print(f"Compiling model: optimizer mode is '{optimizer_mode}'...")
-
-        # Using ADAM optimizer
-        if optimizer_mode == "adam":
-            # Set learning rate
-            if options["lr_decay"]:
-                lr = tf.keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=options["learning_rate"],
-                                                                    decay_steps=options["decay_steps"],
-                                                                    decay_rate=options["decay_rate"])
-            else:
-                lr = options["learning_rate"]
-
-            # Set optimizer
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-        # Using L-BFGS-B optimizer
-        elif optimizer_mode == "l-bfgs-b":
-            optimizer = kormos.optimizers.ScipyBatchOptimizer()
-        # Incorrect mode specified
-        # TODO: raise exception
-        else:
-            print(f"Optimizer mode '{optimizer_mode}' unrecognised, quitting training.")
-            return
-
-        # Define loss function and compile
-        loss = tf.keras.losses.MeanSquaredError()
-        self.model.compile(optimizer=optimizer,
-                           loss=loss)
-
-    # Get default options for model compilation from config
-    @staticmethod
-    def get_default_options(optimizer_mode=cfg.NN_OPTIMIZER):
-        # Using ADAM optimizer
-        if optimizer_mode == "adam":
-            options = {"learning_rate": cfg.ADAM_LEARNING_RATE,
-                       "lr_decay": cfg.ADAM_LR_DECAY,
-                       "decay_steps": cfg.ADAM_LR_DECAY_STEPS,
-                       "decay_rate": cfg.ADAM_LR_DECAY_RATE}
-        # Using L-BFGS-B optimizer
-        elif optimizer_mode == "l-bfgs-b":
-            options = {"maxcor": cfg.BFGS_MAXCOR,
-                       "gtol": cfg.BFGS_GTOL}
-        # Incorrect mode specified
-        # TODO: raise exception
-        else:
-            print(f"Optimizer mode '{optimizer_mode}' unrecognised.")
-            return
-        return options
-
-    # Create datasets from data and set metadata parameters
-    def init_data(self,
-                  data,
-                  mesh_dir,
-                  file_num,
-                  val_split=cfg.NN_VALIDATION_SPLIT):
-        self.train_X, self.train_mesh_X, self.train_y, \
-        self.val_X, self.val_mesh_X, self.val_y = self.create_datasets(data=data,
-                                                                       mesh_dir=mesh_dir,
-                                                                       file_num=file_num,
-                                                                       val_split=val_split)
-
-    # Create training/validation/testing datasets from an array of simulations
-    def create_datasets(self,
-                        data,
-                        mesh_dir,
-                        file_num,
-                        val_split=cfg.NN_VALIDATION_SPLIT):
-        # Readability
-        x_len_samples = data.shape[-3]
-        y_len_samples = data.shape[-2]
-        t_len_samples = data.shape[-1]
-        num_solutions = data.shape[0]
-        t_lookback = self.metadata["t_lookback"]
-
-        # Loop through all solutions in dataset
-        steps_to_predict = t_len_samples - t_lookback
-        a = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, t_lookback])
-        a_mesh = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
-        u = np.zeros([num_solutions, steps_to_predict, x_len_samples, y_len_samples, 1])
-        for i, fdtd_sol in enumerate(data):
-            # Loop through each solution and create training data for each time slice
-            for t in range(steps_to_predict):
-                # Split data tensor and add to buffers (a, u)
-                mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
-                                      f"{num_solutions * file_num + i}.mesh")
-                a[i, t] = fdtd_sol[:, :, t:t_lookback + t]
-                a_mesh[i, t] = np.expand_dims(mesh, axis=-1)
-                u[i, t] = np.expand_dims(fdtd_sol[:, :, t_lookback + t], axis=-1)
-
-        # Split datasets
-        val_amt = int(np.ceil(num_solutions * val_split))
-        train_amt = num_solutions - val_amt
-        assert val_amt + train_amt == num_solutions
-        train_X = a[:train_amt]
-        train_mesh_X = a_mesh[:train_amt]
-        train_y = u[:train_amt]
-        if val_amt > 0:
-            val_X = a[train_amt:train_amt + val_amt]
-            val_mesh_X = a_mesh[train_amt:train_amt + val_amt]
-            val_y = u[train_amt:train_amt + val_amt]
-        else:
-            val_X, val_mesh_X, val_y = None, None, None
-
-        # Return split datasets
-        return train_X, train_mesh_X, train_y, \
-               val_X, val_mesh_X, val_y
 
     # Saves prediction data
     def save_data(self,
@@ -371,36 +268,42 @@ class AcousticNet:
                         file_num,
                         file_name_out=None,
                         batch_size=cfg.NN_BATCH_SIZE,
-                        big_batch_size=cfg.NN_BIG_BATCH_SIZE):
+                        big_batch_size=cfg.NN_BIG_BATCH_SIZE,
+                        pad_data=cfg.NN_PAD_DATA):
         print(f"Obtaining predictions...")
+        t_lookback = self.metadata["t_lookback"]
+        sims_per_block = self.metadata["sims_per_file"]
+
+        if pad_data:
+            padding_amt = t_lookback - (np.shape(data)[-1] % t_lookback)
+            data = np.pad(data, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
+        else:
+            data = data[..., :-(np.shape(data)[-1] % t_lookback)]
 
         # Readability
         x_len_samples = data.shape[-3]
         y_len_samples = data.shape[-2]
         t_len_samples = data.shape[-1]
-        num_solutions = data.shape[0]
-        t_lookback = self.metadata["t_lookback"]
-        steps_to_predict = t_len_samples - t_lookback
+        steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
 
         pred_data = np.zeros_like(data)
         if np.shape(data)[-1] > t_lookback:
             data = data[..., :t_lookback]
         pred_data[..., :t_lookback] = data
 
-        a = np.zeros([num_solutions, x_len_samples, y_len_samples, t_lookback])
-        a_mesh = np.zeros([num_solutions, x_len_samples, y_len_samples, 1])
+        a = np.zeros([sims_per_block, x_len_samples, y_len_samples, t_lookback])
+        a_mesh = np.zeros([sims_per_block, x_len_samples, y_len_samples, 1])
 
         for i, fdtd_sol in enumerate(data):
             mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
-                                  f"{num_solutions * file_num + i}.mesh")
+                                  f"{sims_per_block * file_num + i}.mesh")
             a[i] = fdtd_sol[..., :t_lookback]
             a_mesh[i] = np.expand_dims(mesh, axis=-1)
 
         for step in range(steps_to_predict):
-            pred = np.squeeze(self.model.predict([a, a_mesh], batch_size=batch_size), axis=-1)
-            pred_data[..., step + t_lookback] = pred
-            a[..., :-1] = a[..., 1:t_lookback]
-            a[..., -1] = pred
+            pred = self.model.predict([a, a_mesh], batch_size=batch_size)
+            pred_data[..., step * t_lookback:step * t_lookback + t_lookback] = pred
+            a[..., :] = pred
 
         # Save data
         if file_name_out is not None:
@@ -410,25 +313,35 @@ class AcousticNet:
         # Return predicted data
         return pred_data
 
+    # Compute inverse time decay of learning rate
+    @staticmethod
+    def inverse_time_decay(step,
+                           learning_rate=cfg.ADAM_LEARNING_RATE,
+                           decay_steps=cfg.ADAM_LR_DECAY_STEPS,
+                           decay_rate=cfg.ADAM_LR_DECAY_RATE):
+        return learning_rate / (1 + decay_rate * step / decay_steps)
+
 
 # Fourier neural operator layer
 class FourierLayer(tf.keras.layers.Layer):
     def __init__(self,
                  fft_type,
                  dtype,
-                 in_width=cfg.NN_HL_WIDTH,
-                 out_width=cfg.NN_HL_WIDTH,
+                 fno_width=cfg.FNO_WIDTH,
+                 t_lookback=cfg.FNO_T_LOOKBACK,
                  modes=cfg.FNO_MODES,
+                 padding=cfg.FNO_PADDING,
                  **kwargs):
         super(FourierLayer, self).__init__()
         self.dtype_ = dtype
         self.fft_type = fft_type
-        self.in_width = in_width
-        self.out_width = out_width
+        self.fno_width = fno_width
+        self.t_lookback = t_lookback
         self.modes = modes
-        self.scale = 1 / (self.in_width * self.out_width)
+        self.padding = padding
+        self.scale = 1 / (self.fno_width * self.t_lookback)
 
-    def build(self, input_shape):
+    def build(self, network_shape):
         # Init weights as randomly sampled complex numbers
         def init_weights(shape):
             w_init = self.scale * tf.random.uniform(shape=shape,
@@ -464,7 +377,7 @@ class FourierLayer(tf.keras.layers.Layer):
             self.b_br = init_bias(wb_shape)
         else:
             # Transform a dummy tensor of zeros to get the weight shape
-            x_shape = input_shape[1:].as_list()
+            x_shape = (network_shape[1:-1] + [self.fno_width, ]).as_list()
             x = tf.complex(tf.zeros(x_shape),
                            tf.zeros(x_shape))
             if self.fft_type == "2d":
@@ -486,8 +399,10 @@ class FourierLayer(tf.keras.layers.Layer):
         # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
         # Use fft3d instead for now and just ignore the imaginary part
         # Zero pad beginning & end of signal to account for FFT periodicity
-        pad_sz = 4
-        padded_inputs = tf.pad(inputs, [[0, 0], [pad_sz, pad_sz], [pad_sz, pad_sz], [pad_sz, pad_sz]])
+        padded_inputs = tf.pad(inputs, [[0, 0],
+                                        [self.padding, self.padding],
+                                        [self.padding, self.padding],
+                                        [self.padding, self.padding]])
         x = tf.complex(padded_inputs, padded_inputs)
         x_ft = tf.math.real(tf.signal.fft3d(x))
 
@@ -522,12 +437,15 @@ class FourierLayer(tf.keras.layers.Layer):
                         [0, in_shape[1] - xwb_shape[1]],  # X
                         [0, in_shape[2] - xwb_shape[2]]]  # Y
             if self.fft_type == "3d":
-                paddings.append([0, self.out_width - xwb_shape[3]])  # T
+                paddings.append([0, self.fno_width - xwb_shape[3]])  # T
             xwb = tf.pad(xwb, paddings)
 
         # Otherwise handle the signal normally
         else:
-            xwb = tf.add(tf.multiply(x_ft[:, pad_sz:-pad_sz, pad_sz:-pad_sz, pad_sz:-pad_sz], self.w), self.b)
+            xwb = tf.add(tf.multiply(x_ft[:,
+                                     self.padding:-self.padding,
+                                     self.padding:-self.padding,
+                                     self.padding:-self.padding], self.w), self.b)
 
         # Inverse FFT, take real part and return
         # See earlier comment on rfft3d to explain this weirdness
@@ -536,15 +454,15 @@ class FourierLayer(tf.keras.layers.Layer):
         else:
             x_r = tf.signal.ifft3d(tf.complex(xwb, xwb))
         output = tf.math.real(x_r)
-        return output#[:, pad_sz:-pad_sz, pad_sz:-pad_sz, pad_sz:-pad_sz]
+        return output  # [:, pad_sz:-pad_sz, pad_sz:-pad_sz, pad_sz:-pad_sz]
 
     # BUG: saving .h5 model with SciPy optimizer breaks as it doesn't have a get_config function
     def get_config(self):
         config = super().get_config().copy()
         config.update({
             "fft_type": self.fft_type,
-            "in_width": self.in_width,
-            "out_width": self.out_width,
+            "fno_width": self.fno_width,
+            "t_lookback": self.t_lookback,
             "modes": self.modes
         })
         return config
