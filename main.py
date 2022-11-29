@@ -77,7 +77,7 @@ if LOAD_MODEL is not None:
         # Fit and save
         manager.nn.fit_model(fdtd_dir=FDTD_NAME,
                              mesh_dir=FDTD_NAME,
-                             num_blocks=20)#fdtd_meta["num_files"])
+                             num_blocks=fdtd_meta["num_files"])
         manager.nn.save_model(model_name_out=SIM_NAME)
 
 # Loop through test data files

@@ -272,7 +272,6 @@ class AcousticNet:
                         pad_data=cfg.NN_PAD_DATA):
         print(f"Obtaining predictions...")
         t_lookback = self.metadata["t_lookback"]
-        sims_per_block = self.metadata["sims_per_file"]
 
         if pad_data:
             padding_amt = t_lookback - (np.shape(data)[-1] % t_lookback)
@@ -284,6 +283,7 @@ class AcousticNet:
         x_len_samples = data.shape[-3]
         y_len_samples = data.shape[-2]
         t_len_samples = data.shape[-1]
+        sims_per_block = data.shape[0]
         steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
 
         pred_data = np.zeros_like(data)
