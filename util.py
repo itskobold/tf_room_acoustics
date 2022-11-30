@@ -43,16 +43,16 @@ class Util:
     # Loop through FDTD data, output unshuffled data prepared for neural network input
     def create_raw_input_data(self,
                               fdtd_dir,
+                              num_blocks,
                               t_lookback=cfg.FNO_T_LOOKBACK,
                               pad_data=cfg.NN_PAD_DATA):
-        print(f"Creating raw input data for FDTD simulation {fdtd_dir}...")
+        print(f"Creating raw input data for FDTD dataset '{fdtd_dir}'...")
         fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
         input_path = f"{fdtd_path}input/raw/"
         X_path = f"{input_path}X/"
         mesh_X_path = f"{input_path}mesh_X/"
         y_path = f"{input_path}y/"
-        meta = load_json(f"{fdtd_path}{fdtd_dir}/meta.json")
-        num_blocks = meta["num_files"]
+        meta = load_json(f"{fdtd_path}meta.json")
         sims_per_block = meta["sims_per_file"]
 
         # Loop through all blocks created by FDTD simulation
@@ -101,16 +101,13 @@ class Util:
     # Process raw input data by shuffling it together
     def prepare_raw_data_for_network(self,
                                      fdtd_dir,
+                                     num_blocks,
                                      shuffle_passes=cfg.NN_SHUFFLE_PASSES):
-        print("Shuffling raw datasets together...")
-
-        # Load FDTD metadata
-        meta = load_json(f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/meta.json")
-        num_blocks = meta["num_files"]
+        print(f"Shuffling raw datasets together for FDTD dataset '{fdtd_dir}'...")
 
         # Shuffle through entire dataset multiple times
         for i in range(shuffle_passes):
-            print(f"Shuffling raw data blocks: {i + 1}/{shuffle_passes}...")
+            print(f"Shuffling raw data blocks: pass {i + 1}/{shuffle_passes}...")
 
             # Handle directories
             fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"

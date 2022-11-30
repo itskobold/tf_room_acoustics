@@ -159,11 +159,7 @@ class Renderer:
         print(f"Animating difference between true and predicted data '{file_name_out}'.")
 
         # True and predicted data should be the same shapes
-        pred_shape = np.shape(pred_data)
-        td_diff = np.shape(true_data)[-1] - pred_shape[-1]
-        true_data = true_data[:, :, td_diff:]
-        true_shape = np.shape(true_data)
-        assert true_shape == pred_shape
+        assert pred_data.shape == true_data.shape
 
         # Do animation
         anim = self.animation(data=true_data - pred_data,

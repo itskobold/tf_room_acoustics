@@ -97,7 +97,7 @@ class AcousticNet:
                                                     variance=var)(layers[-1]))
 
         # Concatenate absorption map with solution layers
-        #layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
+        # layers.append(ConcatAbsorption(dtype=self.manager.metadata["dtype"])([layers[-1], mesh_input]))
 
         # Append up projection layer (linear, no activation)
         layers.append(tf.keras.layers.Dense(fno_width, activation=None)(layers[-1]))
@@ -150,7 +150,6 @@ class AcousticNet:
         fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
         mesh_path = f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
         meta = util.load_json(f"{fdtd_path}meta.json")
-        sims_per_block = meta["sims_per_file"]
         initial_epoch = 0
         t0 = datetime.now()
         for pass_num in range(num_passes):
@@ -174,9 +173,8 @@ class AcousticNet:
                 y_data = util.load_data(f"{fdtd_path}input/y/{block_id}.pkl")
 
                 # Split datasets
-                val_amt = int(np.ceil(sims_per_block * val_split))
-                train_amt = sims_per_block - val_amt
-                assert val_amt + train_amt == sims_per_block
+                val_amt = int(np.ceil(X_data.shape[0] * val_split))
+                train_amt = X_data.shape[0] - val_amt
                 train_X = X_data[:train_amt]
                 train_mesh_X_ids = mesh_X_ids[:train_amt]
                 train_y = y_data[:train_amt]
@@ -189,8 +187,8 @@ class AcousticNet:
                                          meta["dim_lengths_samples"][0],
                                          meta["dim_lengths_samples"][1],
                                          1])
-                for mesh_id in range(train_mesh_X_ids.shape[0]):
-                    train_mesh_X[mesh_id] = np.expand_dims(util.load_data(f"{mesh_path}{mesh_id}.mesh"), axis=-1)
+                for i, mesh_id in enumerate(train_mesh_X_ids):
+                    train_mesh_X[i] = np.expand_dims(util.load_data(f"{mesh_path}{int(mesh_id)}.mesh"), axis=-1)
 
                 # Loop through big batches
                 num_big_batches = int(np.ceil(train_X.shape[0] / big_batch_size))
@@ -212,8 +210,8 @@ class AcousticNet:
                                                meta["dim_lengths_samples"][0],
                                                meta["dim_lengths_samples"][1],
                                                1])
-                        for mesh_id in range(val_mesh_X_ids.shape[0]):
-                            val_mesh_X[mesh_id] = np.expand_dims(util.load_data(f"{mesh_path}{mesh_id}.mesh"), axis=-1)
+                        for i, mesh_id in enumerate(val_mesh_X_ids):
+                            val_mesh_X[i] = np.expand_dims(util.load_data(f"{mesh_path}{int(mesh_id)}.mesh"), axis=-1)
 
                         # Create data tensor
                         val_dataset = tf.data.Dataset.from_tensor_slices((val_X, val_mesh_X, val_y)) \
@@ -253,6 +251,7 @@ class AcousticNet:
                     # Update initial epoch and clear train dataset tensor
                     initial_epoch += iterations
                     del train_dataset
+                    del val_dataset
 
         # Add training time to metadata
         training_time = datetime.now() - t0
@@ -275,28 +274,19 @@ class AcousticNet:
         util.save_data(full_path, data)
         print(f'Saved prediction data as {full_path}".\n')
 
-    # Wrapper to pass data into model, stacks individual simulations into one big block for batching
-    @staticmethod
-    def prepare_dataset_for_model(data):
-        shape = np.shape(data)
-        new_shape = (shape[0] * shape[1],) + shape[2:]
-        data_reshaped = np.reshape(data, new_shape)
-        return data_reshaped
-
     # Get predictions for a block of simulation data
     # Saves if file_name is not None
-    # TODO: evaluate against test_Y if not none
     def get_predictions(self,
                         data,
                         mesh_dir,
                         file_num,
                         file_name_out=None,
                         batch_size=cfg.NN_BATCH_SIZE,
-                        big_batch_size=cfg.NN_BIG_BATCH_SIZE,
                         pad_data=cfg.NN_PAD_DATA):
         print(f"Obtaining predictions...")
         t_lookback = self.metadata["t_lookback"]
 
+        # Pad or trim data
         if pad_data:
             padding_amt = t_lookback - (np.shape(data)[-1] % t_lookback)
             data = np.pad(data, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
@@ -310,21 +300,25 @@ class AcousticNet:
         sims_per_block = data.shape[0]
         steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
 
+        # Only take first t_lookback steps from true data
         pred_data = np.zeros_like(data)
         if np.shape(data)[-1] > t_lookback:
             data = data[..., :t_lookback]
         pred_data[..., :t_lookback] = data
 
+        # Buffers only take 1 step at a time
         a = np.zeros([sims_per_block, x_len_samples, y_len_samples, t_lookback])
         a_mesh = np.zeros([sims_per_block, x_len_samples, y_len_samples, 1])
 
+        # Load initial data and mesh into buffers
         for i, fdtd_sol in enumerate(data):
             mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
                                   f"{sims_per_block * file_num + i}.mesh")
             a[i] = fdtd_sol[..., :t_lookback]
             a_mesh[i] = np.expand_dims(mesh, axis=-1)
 
-        for step in range(steps_to_predict):
+        # Predict & set next data for input as newly predicted data
+        for step in range(1, steps_to_predict):
             pred = self.model.predict([a, a_mesh], batch_size=batch_size)
             pred_data[..., step * t_lookback:step * t_lookback + t_lookback] = pred
             a[..., :] = pred
@@ -423,11 +417,14 @@ class FourierLayer(tf.keras.layers.Layer):
         # Ideally rfft3d should be used, but tf hasn't got a gradient defined for that yet
         # Use fft3d instead for now and just ignore the imaginary part
         # Zero pad beginning & end of signal to account for FFT periodicity
-        padded_inputs = tf.pad(inputs, [[0, 0],
-                                        [self.padding, self.padding],
-                                        [self.padding, self.padding],
-                                        [self.padding, self.padding]])
-        x = tf.complex(padded_inputs, padded_inputs)
+        if self.padding > 0:
+            x_data = tf.pad(inputs, [[0, 0],
+                                     [self.padding, self.padding],
+                                     [self.padding, self.padding],
+                                     [self.padding, self.padding]])
+        else:
+            x_data = inputs
+        x = tf.complex(x_data, x_data)
         x_ft = tf.math.real(tf.signal.fft3d(x))
 
         # Drop Fourier modes as a regularization measure
@@ -466,10 +463,12 @@ class FourierLayer(tf.keras.layers.Layer):
 
         # Otherwise handle the signal normally
         else:
-            xwb = tf.add(tf.multiply(x_ft[:,
-                                     self.padding:-self.padding,
-                                     self.padding:-self.padding,
-                                     self.padding:-self.padding], self.w), self.b)
+            if self.padding > 0:
+                x_ft = x_ft[:,
+                       self.padding:-self.padding,
+                       self.padding:-self.padding,
+                       self.padding:-self.padding]
+            xwb = tf.add(tf.multiply(x_ft, self.w), self.b)
 
         # Inverse FFT, take real part and return
         # See earlier comment on rfft3d to explain this weirdness

@@ -302,7 +302,8 @@ class FDTD:
                 # Avoid duplicate entries
                 while True:
                     ic_point = self.sample_collocation_point(mesh)
-                    if ic_point not in ic_points:
+                    # TODO: change this when meshes & BCs are handled separately
+                    if ic_point not in np.reshape(ic_points, [num_meshes * num_sims_per_mesh, 2]):
                         ic_points[i, j] = ic_point
                         break
         return ic_points
@@ -363,7 +364,7 @@ class FDTD:
                 bc_abs = np.zeros(4)
                 for j in range(count):
                     bc_abs[j] = get_bc_abs()
-                if bc_abs not in bc_coeffs[i]:
+                if bc_abs not in bc_coeffs:
                     bc_coeffs[i] = bc_abs
                     break
 

@@ -4,18 +4,19 @@ from project import ProjectManager
 import numpy as np
 
 RENDER_ERROR = True
-RENDER_ANIMS = True
 RENDER_FDTD_ANIMS = False
+RENDER_TEST_ANIMS = True
+RENDER_ERROR_ANIMS = False
 RENDER_IRS = False
 
 CREATE_MESHES = False
 CREATE_MESHES_TEST = False
 RUN_FDTD = False
 RUN_FDTD_TEST = False
-CREATE_RAW_INPUT_DATA = False
-PROCESS_RAW_INPUT_DATA = False
+CREATE_RAW_TRAINING_DATA = False
+PROCESS_RAW_TRAINING_DATA = False
 
-LOAD_MODEL = False
+LOAD_MODEL = True
 GET_PREDICTIONS = True
 
 # Init project
@@ -57,15 +58,18 @@ if RUN_FDTD_TEST:
                      ic_points=ic_points)
 
 # Create raw input data from FDTD data
-if CREATE_RAW_INPUT_DATA:
-    manager.util.create_raw_input_data(fdtd_dir=FDTD_NAME)
+fdtd_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}/meta.json")
+if CREATE_RAW_TRAINING_DATA:
+    manager.util.create_raw_input_data(fdtd_dir=FDTD_NAME,
+                                       num_blocks=fdtd_meta["num_files"])
 
 # Shuffle training data for input to network
-if PROCESS_RAW_INPUT_DATA:
-    manager.util.prepare_raw_data_for_network(fdtd_dir=FDTD_NAME)
+if PROCESS_RAW_TRAINING_DATA:
+    manager.util.prepare_raw_data_for_network(fdtd_dir=FDTD_NAME,
+                                              num_blocks=fdtd_meta["num_files"])
 
 # Load model or fit a new model to data
-fdtd_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}/meta.json")
+num_blocks = fdtd_meta["num_files"]
 if LOAD_MODEL is not None:
     if LOAD_MODEL:
         manager.nn.load_model(SIM_NAME)
@@ -74,20 +78,19 @@ if LOAD_MODEL is not None:
         network_shape = util.network_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
         manager.nn.init_model(network_shape=network_shape,
                               fdtd_dir=FDTD_NAME,
-                              num_blocks=fdtd_meta["num_files"])
+                              num_blocks=num_blocks)
 
         # Fit and save
         manager.nn.fit_model(fdtd_dir=FDTD_NAME,
                              mesh_dir=FDTD_NAME,
-                             num_blocks=fdtd_meta["num_files"])
+                             num_blocks=num_blocks)
         manager.nn.save_model(model_name_out=SIM_NAME)
 
 # Loop through test data files
 fdtd_test_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/meta.json")
-num_files = fdtd_test_meta["num_files"]
 errors_mae, titles_mae, file_names_out_mae = [], [], []
 errors_rmse, titles_rmse, file_names_out_rmse = [], [], []
-for i in range(num_files):
+for i in range(num_blocks):
     # Get predictions and save data
     test_data = util.load_data(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/{i}.pkl")
 
@@ -99,7 +102,7 @@ for i in range(num_files):
     else:
         pred_data = util.load_data(f"{manager.get_proj_path()}pred/{SIM_NAME}_{i}.pkl")
 
-    # Render animations
+    # Render animations & plots
     num_simulations = np.shape(test_data)[0]
     for test_index in range(num_simulations):
         total_index = i * num_simulations + test_index
@@ -107,6 +110,7 @@ for i in range(num_files):
         mesh_id = fdtd_test_meta[str(total_index)]["i"]
         mesh = util.load_data(f"{manager.get_proj_path()}mesh/{FDTD_NAME}_test/{mesh_id}.mesh")
 
+        # Error heatmaps
         if RENDER_ERROR:
             errors_mae.append(util.calc_error_heatmap(true_data=test_data[test_index],
                                                       pred_data=pred_data[test_index],
@@ -124,18 +128,20 @@ for i in range(num_files):
             file_names_out_rmse.append(f"{SIM_NAME}_rmse_"
                                        f"{total_index}")
 
+        # Animations
         if RENDER_FDTD_ANIMS:
             manager.renderer.animate_sound_field(data=test_data[test_index],
                                                  mesh=mesh,
                                                  file_name_out=f"{SIM_NAME}_fdtd_{total_index}",
                                                  title="Data$_{true}$\n"
                                                        f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$")
-        if RENDER_ANIMS:
+        if RENDER_TEST_ANIMS:
             manager.renderer.animate_sound_field(data=pred_data[test_index],
                                                  mesh=mesh,
                                                  file_name_out=f"{SIM_NAME}_pred_{total_index}",
                                                  title="Data$_{prediction}$\n"
                                                        f"IC $(x, y)$: ${util.array_to_formatted_str(ic_pos)}$")
+        if RENDER_ERROR_ANIMS:
             manager.renderer.animate_sound_field_difference(true_data=test_data[test_index],
                                                             pred_data=pred_data[test_index],
                                                             mesh=mesh,
