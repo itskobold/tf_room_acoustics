@@ -6,7 +6,7 @@ import numpy as np
 RENDER_ERROR = True
 RENDER_FDTD_ANIMS = False
 RENDER_TEST_ANIMS = True
-RENDER_ERROR_ANIMS = False
+RENDER_ERROR_ANIMS = True
 RENDER_IRS = False
 
 CREATE_MESHES = False
@@ -17,12 +17,12 @@ CREATE_RAW_TRAINING_DATA = False
 PROCESS_RAW_TRAINING_DATA = False
 
 LOAD_MODEL = True
-GET_PREDICTIONS = True
+GET_PREDICTIONS = False
 
 # Init project
 PROJ_NAME = "square_0.1s"
-FDTD_NAME = "no_absorb"
-SIM_NAME = "no_absorb"
+FDTD_NAME = "no_absorb_t1"
+SIM_NAME = "no_absorb_t1"
 manager = ProjectManager(proj_name=PROJ_NAME)
 
 # Create meshes
@@ -75,8 +75,10 @@ if LOAD_MODEL is not None:
         manager.nn.load_model(SIM_NAME)
     else:
         # Init model
-        network_shape = util.network_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
-        manager.nn.init_model(network_shape=network_shape,
+        input_shape = util.input_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
+        output_shape = util.output_shape_from_data_shape(fdtd_meta["dim_lengths_samples"])
+        manager.nn.init_model(input_shape=input_shape,
+                              output_shape=output_shape,
                               fdtd_dir=FDTD_NAME,
                               num_blocks=num_blocks)
 
@@ -90,12 +92,12 @@ if LOAD_MODEL is not None:
 fdtd_test_meta = util.load_json(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/meta.json")
 errors_mae, titles_mae, file_names_out_mae = [], [], []
 errors_rmse, titles_rmse, file_names_out_rmse = [], [], []
-for i in range(num_blocks):
+for i in range(fdtd_test_meta["num_files"]):
     # Get predictions and save data
     test_data = util.load_data(f"{manager.get_proj_path()}fdtd/{FDTD_NAME}_test/{i}.pkl")
 
     if GET_PREDICTIONS:
-        pred_data = manager.nn.get_predictions(data=test_data,
+        pred_data = manager.nn.get_predictions(block=test_data,
                                                mesh_dir=FDTD_NAME,
                                                file_num=i,
                                                file_name_out=f"{SIM_NAME}_{i}")

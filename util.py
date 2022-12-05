@@ -45,6 +45,7 @@ class Util:
                               fdtd_dir,
                               num_blocks,
                               t_lookback=cfg.FNO_T_LOOKBACK,
+                              t_out_size=cfg.NN_OUTPUT_T_LEN,
                               pad_data=cfg.NN_PAD_DATA):
         print(f"Creating raw input data for FDTD dataset '{fdtd_dir}'...")
         fdtd_path = f"{self.manager.get_proj_path()}fdtd/{fdtd_dir}/"
@@ -52,6 +53,9 @@ class Util:
         X_path = f"{input_path}X/"
         mesh_X_path = f"{input_path}mesh_X/"
         y_path = f"{input_path}y/"
+        create_folder(X_path)
+        create_folder(mesh_X_path)
+        create_folder(y_path)
         meta = load_json(f"{fdtd_path}meta.json")
         sims_per_block = meta["sims_per_file"]
 
@@ -62,10 +66,10 @@ class Util:
 
             # Pad/trim data
             if pad_data:
-                padding_amt = t_lookback - (block.shape[-1] % t_lookback)
+                padding_amt = t_out_size - (block.shape[-1] % t_out_size)
                 block = np.pad(block, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
-            else:
-                block = block[..., :-(block.shape[-1] % t_lookback)]
+            elif t_out_size > 1:
+                block = block[..., :-(block.shape[-1] % t_out_size)]
 
             # Readability
             x_len_samples = block.shape[-3]
@@ -73,25 +77,24 @@ class Util:
             t_len_samples = block.shape[-1]
 
             # Create data buffers
-            steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
+            steps_to_predict = int(t_len_samples - t_lookback)
+            if t_out_size > 1:
+                steps_to_predict /= t_out_size
             a = np.zeros([sims_per_block * steps_to_predict, x_len_samples, y_len_samples, t_lookback])
             a_mesh = np.zeros([sims_per_block * steps_to_predict, 1])
-            u = np.zeros([sims_per_block * steps_to_predict, x_len_samples, y_len_samples, t_lookback])
+            u = np.zeros([sims_per_block * steps_to_predict, x_len_samples, y_len_samples, t_out_size])
 
             # Loop through all solutions in dataset
             for i, fdtd_data in enumerate(block):
                 # Split data into chunks and add to buffers (a, a_mesh, u)
                 for step in range(steps_to_predict):
-                    t = step * t_lookback
+                    t = step * t_out_size
                     step_id = i * steps_to_predict + step
                     a[step_id] = fdtd_data[..., t:t + t_lookback]
                     a_mesh[step_id] = meta[f"{block_id * sims_per_block + i}"]["i"]
-                    u[step_id] = fdtd_data[..., t + t_lookback:t + t_lookback + t_lookback]
+                    u[step_id] = fdtd_data[..., t + t_lookback:t + t_lookback + t_out_size]
 
             # Save data
-            create_folder(X_path)
-            create_folder(mesh_X_path)
-            create_folder(y_path)
             save_data(f"{X_path}{block_id}.pkl", a)
             save_data(f"{mesh_X_path}{block_id}.pkl", a_mesh)
             save_data(f"{y_path}{block_id}.pkl", u)
@@ -163,10 +166,16 @@ def timedelta_to_str(timedelta):
     return f"{hours} hours, {minutes} mins, {seconds} secs"
 
 
-# Get neural network shape from data shape (X, Y, T).
-def network_shape_from_data_shape(data_shape,
-                                  t_lookback=cfg.FNO_T_LOOKBACK):
+# Get network input shape from data shape (X, Y, T).
+def input_shape_from_data_shape(data_shape,
+                                t_lookback=cfg.FNO_T_LOOKBACK):
     return data_shape[:2] + [t_lookback]
+
+
+# Get network output shape from data shape (X, Y, T).
+def output_shape_from_data_shape(data_shape,
+                                 t_out_size=cfg.NN_OUTPUT_T_LEN):
+    return data_shape[:2] + [t_out_size]
 
 
 # Mean relative error.

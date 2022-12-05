@@ -56,27 +56,31 @@ class AcousticNet:
 
     # Create a new Tensorflow model.
     def init_model(self,
-                   network_shape,
+                   input_shape,
+                   output_shape,
                    fdtd_dir,
                    num_blocks,
                    num_hidden_layers=cfg.FNO_HIDDEN_LAYERS,
                    fno_width=cfg.FNO_WIDTH,
                    dense_width=cfg.NN_HL_WIDTH,
                    t_lookback=cfg.FNO_T_LOOKBACK,
+                   t_out_size=cfg.NN_OUTPUT_T_LEN,
                    modes=cfg.FNO_MODES):
         print("Initializing neural network model...")
 
         # Set metadata parameters
-        self.metadata["network_shape"] = network_shape
-        self.metadata["mesh_input_shape"] = network_shape[:2] + [1]
+        self.metadata["input_shape"] = input_shape
+        self.metadata["mesh_input_shape"] = input_shape[:2] + [1]
+        self.metadata["output_shape"] = output_shape
         self.metadata["t_lookback"] = t_lookback
+        self.metadata["t_out_size"] = t_out_size
 
         # Print warning if t_lookback is too short to capture first order reflections from boundaries for sure
-        if self.metadata["network_shape"][0] > t_lookback or \
-                self.metadata["network_shape"][1] > t_lookback:
+        if self.metadata["input_shape"][0] > t_lookback or \
+                self.metadata["input_shape"][1] > t_lookback:
             print("\nWARNING: t_lookback might be too short to capture first order reflections from all boundaries! "
                   f"t_lookback = {self.metadata['t_lookback']}, "
-                  f"network_shape (X, Y) = {self.metadata['network_shape'][:2]}.")
+                  f"input_shape (X, Y) = {self.metadata['input_shape'][:2]}.")
 
         # Get dataset mean & variance
         means, vars = [], []
@@ -91,7 +95,9 @@ class AcousticNet:
         mesh_input = tf.keras.Input(self.metadata["mesh_input_shape"])
 
         # Create solution input & list for layers
-        layers = [tf.keras.Input(self.metadata["network_shape"])]
+        layers = [tf.keras.Input(self.metadata["input_shape"])]
+
+        # Append normalization layer
         layers.append(tf.keras.layers.Normalization(axis=None,
                                                     mean=mean,
                                                     variance=var)(layers[-1]))
@@ -120,7 +126,7 @@ class AcousticNet:
                                             activation=None)(layers[-1]))
 
         # Append output layer
-        layers.append(tf.keras.layers.Dense(self.metadata["network_shape"][-1],
+        layers.append(tf.keras.layers.Dense(self.metadata["output_shape"][-1],
                                             activation=None)(layers[-1]))
 
         # Append transformation layer to constrain predictions within boundaries
@@ -139,6 +145,7 @@ class AcousticNet:
                   num_blocks,
                   iterations=cfg.NN_ITERATIONS,
                   learning_rate=cfg.ADAM_LEARNING_RATE,
+                  lr_decay=cfg.ADAM_LR_DECAY,
                   decay_steps=cfg.ADAM_LR_DECAY_STEPS,
                   decay_rate=cfg.ADAM_LR_DECAY_RATE,
                   val_split=cfg.NN_VALIDATION_SPLIT,
@@ -151,12 +158,19 @@ class AcousticNet:
         mesh_path = f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
         meta = util.load_json(f"{fdtd_path}meta.json")
         initial_epoch = 0
+
+        loss_fn = tf.keras.losses.MeanSquaredError()
+        train_metric = tf.keras.metrics.MeanSquaredError()
+        val_metric = tf.keras.metrics.MeanSquaredError()
+        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
+        self.model.compile(optimizer=optimizer,
+                           loss=loss_fn,
+                           metrics=[train_metric])
+
         t0 = datetime.now()
         for pass_num in range(num_passes):
             print(f"Beginning training pass {pass_num + 1}/{num_passes}.")
-            loss_fn = tf.keras.losses.MeanSquaredError()
-            train_metric = tf.keras.metrics.MeanSquaredError()
-            val_metric = tf.keras.metrics.MeanSquaredError()
 
             # Shuffle order of blocks
             block_ids = np.arange(num_blocks)
@@ -192,66 +206,73 @@ class AcousticNet:
 
                 # Loop through big batches
                 num_big_batches = int(np.ceil(train_X.shape[0] / big_batch_size))
-                for big_batch in range(num_big_batches):
-                    print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
+                #for big_batch in range(num_big_batches):
+                #    print(f"Training big batch {big_batch + 1}/{num_big_batches}...\n")
 
-                    # Create train dataset tensor
-                    train_dataset = tf.data.Dataset.from_tensor_slices((train_X, train_mesh_X, train_y)) \
+                # Create train dataset tensor
+                train_dataset = tf.data.Dataset.from_tensor_slices((train_X, train_mesh_X, train_y)) \
+                    .batch(batch_size)
+
+                # Create validation data
+                if val_amt > 0:
+                    val_X = X_data[train_amt:train_amt + val_amt]
+                    val_mesh_X_ids = mesh_X_ids[train_amt:train_amt + val_amt]
+                    val_y = y_data[train_amt:train_amt + val_amt]
+
+                    # Load meshes
+                    val_mesh_X = np.zeros([val_mesh_X_ids.shape[0],
+                                           meta["dim_lengths_samples"][0],
+                                           meta["dim_lengths_samples"][1],
+                                           1])
+                    for i, mesh_id in enumerate(val_mesh_X_ids):
+                        val_mesh_X[i] = np.expand_dims(util.load_data(f"{mesh_path}{int(mesh_id)}.mesh"), axis=-1)
+
+                    # Create data tensor
+                    val_dataset = tf.data.Dataset.from_tensor_slices((val_X, val_mesh_X, val_y)) \
                         .batch(batch_size)
+                else:
+                    val_dataset = None
 
-                    # Create validation data
-                    if val_amt > 0:
-                        val_X = X_data[train_amt:train_amt + val_amt]
-                        val_mesh_X_ids = mesh_X_ids[train_amt:train_amt + val_amt]
-                        val_y = y_data[train_amt:train_amt + val_amt]
+                # Train over number of iterations
+                for i in range(iterations):
+                    # Train each batch
+                    for step, (train_batch_X, train_mesh_batch_X, train_batch_y) in enumerate(train_dataset):
+                        with tf.GradientTape() as tape:
+                            logits = self.model([train_batch_X, train_mesh_batch_X], training=True)
+                            losses = loss_fn(train_batch_y, logits)
+                        grads = tape.gradient(losses, self.model.trainable_weights)
 
-                        # Load meshes
-                        val_mesh_X = np.zeros([val_mesh_X_ids.shape[0],
-                                               meta["dim_lengths_samples"][0],
-                                               meta["dim_lengths_samples"][1],
-                                               1])
-                        for i, mesh_id in enumerate(val_mesh_X_ids):
-                            val_mesh_X[i] = np.expand_dims(util.load_data(f"{mesh_path}{int(mesh_id)}.mesh"), axis=-1)
-
-                        # Create data tensor
-                        val_dataset = tf.data.Dataset.from_tensor_slices((val_X, val_mesh_X, val_y)) \
-                            .batch(batch_size)
-                    else:
-                        val_dataset = None
-
-                    # Train over number of iterations
-                    for i in range(iterations):
-                        # Train each batch
-                        for step, (train_batch_X, train_mesh_batch_X, train_batch_y) in enumerate(train_dataset):
-                            with tf.GradientTape() as tape:
-                                logits = self.model([train_batch_X, train_mesh_batch_X], training=True)
-                                losses = loss_fn(train_batch_y, logits)
-                            grads = tape.gradient(losses, self.model.trainable_weights)
+                        # Decay learning rate
+                        if lr_decay:
                             lr = self.inverse_time_decay(initial_epoch + i,
                                                          learning_rate=learning_rate,
                                                          decay_steps=decay_steps,
                                                          decay_rate=decay_rate)
-                            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-                            optimizer.apply_gradients(zip(grads, self.model.trainable_weights))
-                            train_metric.update_state(train_batch_y, logits)
-
-                        # Evaluate validation dataset
-                        if val_dataset is not None:
-                            for val_batch_X, val_mesh_batch_X, val_batch_y in val_dataset:
-                                val_logits = self.model([val_batch_X, val_mesh_batch_X], training=False)
-                                val_metric.update_state(val_batch_y, val_logits)
-                            str_app = f", Val = {val_metric.result():.8e}"
-                            val_metric.reset_states()
                         else:
-                            str_app = ""
+                            lr = learning_rate
 
-                        print(f"It: {initial_epoch + i}, Loss = {train_metric.result():.8e}{str_app}")
-                        train_metric.reset_states()
+                        # Optimize network weights
+                        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+                        optimizer.apply_gradients(zip(grads, self.model.trainable_weights))
+                        train_metric.update_state(train_batch_y, logits)
 
-                    # Update initial epoch and clear train dataset tensor
-                    initial_epoch += iterations
-                    del train_dataset
-                    del val_dataset
+                    # Evaluate validation dataset
+                    if val_dataset is not None:
+                        for val_batch_X, val_mesh_batch_X, val_batch_y in val_dataset:
+                            val_logits = self.model([val_batch_X, val_mesh_batch_X], training=False)
+                            val_metric.update_state(val_batch_y, val_logits)
+                        str_app = f", Val = {val_metric.result():.8e}"
+                        val_metric.reset_states()
+                    else:
+                        str_app = ""
+
+                    print(f"It: {initial_epoch + i}, Loss = {train_metric.result():.8e}{str_app}")
+                    train_metric.reset_states()
+
+                # Update initial epoch and clear train dataset tensor
+                initial_epoch += iterations
+                del train_dataset
+                del val_dataset
 
         # Add training time to metadata
         training_time = datetime.now() - t0
@@ -277,51 +298,52 @@ class AcousticNet:
     # Get predictions for a block of simulation data
     # Saves if file_name is not None
     def get_predictions(self,
-                        data,
+                        block,
                         mesh_dir,
                         file_num,
                         file_name_out=None,
                         batch_size=cfg.NN_BATCH_SIZE,
                         pad_data=cfg.NN_PAD_DATA):
         print(f"Obtaining predictions...")
+        # Readability
         t_lookback = self.metadata["t_lookback"]
+        t_out_size = self.metadata["t_out_size"]
+        x_len_samples = block.shape[-3]
+        y_len_samples = block.shape[-2]
+        t_len_samples = block.shape[-1]
+        sims_per_block = block.shape[0]
+        steps_to_predict = int((t_len_samples - t_lookback) / t_out_size)
 
         # Pad or trim data
         if pad_data:
-            padding_amt = t_lookback - (np.shape(data)[-1] % t_lookback)
-            data = np.pad(data, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
-        else:
-            data = data[..., :-(np.shape(data)[-1] % t_lookback)]
-
-        # Readability
-        x_len_samples = data.shape[-3]
-        y_len_samples = data.shape[-2]
-        t_len_samples = data.shape[-1]
-        sims_per_block = data.shape[0]
-        steps_to_predict = int((t_len_samples - t_lookback) / t_lookback)
+            padding_amt = t_out_size - (np.shape(block)[-1] % t_out_size)
+            block = np.pad(block, [[0, 0], [0, 0], [0, 0], [0, padding_amt]])
+        elif t_out_size > 1:
+            block = block[..., :-(np.shape(block)[-1] % t_out_size)]
 
         # Only take first t_lookback steps from true data
-        pred_data = np.zeros_like(data)
-        if np.shape(data)[-1] > t_lookback:
-            data = data[..., :t_lookback]
-        pred_data[..., :t_lookback] = data
+        pred_data = np.zeros_like(block)
+        pred_data[..., :t_lookback] = block[..., :t_lookback]
 
         # Buffers only take 1 step at a time
         a = np.zeros([sims_per_block, x_len_samples, y_len_samples, t_lookback])
         a_mesh = np.zeros([sims_per_block, x_len_samples, y_len_samples, 1])
 
         # Load initial data and mesh into buffers
-        for i, fdtd_sol in enumerate(data):
+        for i, fdtd_data in enumerate(block):
             mesh = util.load_data(f"{self.manager.get_proj_path()}mesh/{mesh_dir}/"
                                   f"{sims_per_block * file_num + i}.mesh")
-            a[i] = fdtd_sol[..., :t_lookback]
+            a[i] = fdtd_data[..., :t_lookback]
             a_mesh[i] = np.expand_dims(mesh, axis=-1)
 
         # Predict & set next data for input as newly predicted data
-        for step in range(1, steps_to_predict):
+        start = int(t_lookback / t_out_size)
+        for step in range(start, steps_to_predict + 1):
             pred = self.model.predict([a, a_mesh], batch_size=batch_size)
-            pred_data[..., step * t_lookback:step * t_lookback + t_lookback] = pred
-            a[..., :] = pred
+            pred_data[..., step * t_out_size:step * t_out_size + t_out_size] = pred
+            if t_lookback - t_out_size > 0:
+                a[..., :t_lookback - t_out_size] = a[..., t_out_size:]
+            a[..., t_lookback - t_out_size:] = pred#block[..., step * t_out_size:step * t_out_size + t_out_size]  # pred
 
         # Save data
         if file_name_out is not None:
@@ -359,7 +381,7 @@ class FourierLayer(tf.keras.layers.Layer):
         self.padding = padding
         self.scale = 1 / (self.fno_width * self.t_lookback)
 
-    def build(self, network_shape):
+    def build(self, input_shape):
         # Init weights as randomly sampled complex numbers
         def init_weights(shape):
             w_init = self.scale * tf.random.uniform(shape=shape,
@@ -395,7 +417,7 @@ class FourierLayer(tf.keras.layers.Layer):
             self.b_br = init_bias(wb_shape)
         else:
             # Transform a dummy tensor of zeros to get the weight shape
-            x_shape = (network_shape[1:-1] + [self.fno_width, ]).as_list()
+            x_shape = (input_shape[1:-1] + [self.fno_width, ]).as_list()
             x = tf.complex(tf.zeros(x_shape),
                            tf.zeros(x_shape))
             if self.fft_type == "2d":
